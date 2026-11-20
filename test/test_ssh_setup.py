@@ -3,6 +3,7 @@ import contextlib
 import importlib
 import io
 import unittest
+from typing import cast
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 from plumbum.commands import ProcessExecutionError
@@ -51,7 +52,8 @@ class SSHSetupTests(unittest.TestCase):
 
         stream = Stream()
         # Avoid constructing/deleting a real deployed server and its resources.
-        server = SimpleNamespace(proc=SimpleNamespace(stdout=stream))
+        server = cast(rpc.DeployedCrossPlatformServer,
+                      SimpleNamespace(proc=SimpleNamespace(stdout=stream)))
         with patch.object(rpc, "Thread", InlineThread), contextlib.redirect_stdout(io.StringIO()):
             rpc.DeployedCrossPlatformServer._handle_server_startup(server)
         self.assertEqual(server.remote_port, 12345)

@@ -81,6 +81,7 @@ class CrossShellTests(unittest.TestCase):
             remote, python_executable=[executable, '-u'],
             server_script='import sys\nprint(12345, flush=True)\nsys.stdin.read()\n',
         )
+        assert server._tmpdir_ctx is not None
         created = server._tmpdir_ctx.path
         try:
             self.assertEqual(server.remote_port, 12345)

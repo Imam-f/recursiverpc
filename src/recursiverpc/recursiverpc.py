@@ -135,7 +135,7 @@ class Recursive_RPC:
                 case networkprocess(i, j):
                     runner = NetworkRunner(i, j)
                 case proxyprocess(i, j, k, l, m, n):
-                    runner = ProxyRunner(i, j, k, l, m, n)  # type: ignore
+                    runner = ProxyRunner(i, j, k, l, m, n)
                 case _:
                     raise TypeError
             self.weight[index] = runner.process_num

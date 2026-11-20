@@ -5,7 +5,7 @@ import json
 import re
 import shlex
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 import paramiko
 from plumbum.commands import CommandNotFound, ProcessExecutionError
@@ -84,7 +84,7 @@ class SSHProcess(ParamikoPopen):
     def kill(self):
         self.channel.close()
 
-    def communicate(self, input=None, timeout=None):
+    def communicate(self, input: bytes | None = None, timeout: float | None = None):
         if input is not None:
             self.stdin.write(input)
         self.terminate()
@@ -93,8 +93,10 @@ class SSHProcess(ParamikoPopen):
             stderr = executor.submit(self.stderr.read)
             try:
                 result = stdout.result(timeout), stderr.result(timeout)
-            except TimeoutError:
+            except FutureTimeout:
                 self.kill()
+                if timeout is None:
+                    raise
                 raise subprocess.TimeoutExpired(self.argv, timeout)
         self.wait()
         return result
@@ -131,7 +133,7 @@ class ShellAwareMachine:
                 raise RuntimeError("Could not detect SSH shell; specify bash, powershell, or cmd")
         if self.shell not in ("bash", "powershell", "cmd"):
             raise ValueError(f"Unsupported SSH shell: {self.shell}")
-        self.python = None
+        self.python: list[str] = []
         for argv in (["python3"], ["python"], ["py", "-3"],
                      ["uv", "run", "--no-project", "python"]):
             probe = "import sys;print(731029*(sys.version_info>=(3,10)))"
@@ -139,7 +141,7 @@ class ShellAwareMachine:
             if code == 0 and output.strip() == "731029":
                 self.python = argv
                 break
-        if self.python is None:
+        if not self.python:
             raise RuntimeError("Remote Python 3.10+ is required (python3, python, py -3, or uv)")
         self.platform, executable = json.loads(self.python_run(
             "import os,sys,json; print(json.dumps([os.name,sys.executable]))"
@@ -241,7 +243,12 @@ class ShellAwareMachine:
         )
 
     def connect_sock(self, port):
-        return self.client.get_transport().open_channel(
+        if self.client is None:
+            raise RuntimeError("Direct socket forwarding requires a Paramiko connection")
+        transport = self.client.get_transport()
+        if transport is None or not transport.is_active():
+            raise RuntimeError("SSH transport is not connected")
+        return transport.open_channel(
             "direct-tcpip", ("localhost", port), ("localhost", 0)
         )
 
