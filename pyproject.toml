@@ -8,9 +8,12 @@ authors = [
 ]
 requires-python = "~=3.10.16"
 dependencies = [
+    "packaging>=24.2",
     "paramiko>=3.5.1",
     "plumbum>=1.9.0",
+    "pywin32>=306 ; sys_platform == 'win32'",
     "rpyc>=6.0.2",
+    "tomlkit>=0.13.2",
     "uv>=0.7.21",
 ]
 

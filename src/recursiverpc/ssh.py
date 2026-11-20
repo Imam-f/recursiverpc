@@ -229,10 +229,15 @@ class ShellAwareMachine:
         ))
 
     def write_script(self, directory, content):
+        return self.write_file(directory, 'server.py', content.encode('utf-8'))
+
+    def write_file(self, directory, name, content: bytes):
+        if not name or '/' in name or '\\' in name or name in ('.', '..'):
+            raise ValueError('Expected a file name within the temporary project')
         return json.loads(self.python_run(
-            "import json,pathlib,sys; p=pathlib.Path(" + repr(directory) + ")/'server.py'; "
+            "import json,pathlib,sys; p=pathlib.Path(" + repr(directory) + ")/" + repr(name) + "; "
             "p.write_bytes(sys.stdin.buffer.read()); print(json.dumps(str(p)))",
-            input=content.encode("utf-8"),
+            input=content,
         ))
 
     def remove_temp_dir(self, directory):

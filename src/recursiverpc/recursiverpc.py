@@ -26,6 +26,7 @@ from plumbum.commands import CommandNotFound, ProcessExecutionError
 from plumbum.commands.base import BoundCommand
 from plumbum.machines.paramiko_machine import ParamikoMachine
 from .ssh import SSHConnection, RemoteShell, shell_aware
+from .dependencies import DependencyInput, DependencySpec, LocalProject, parse_dependency
 
 old_print = print
 
@@ -123,7 +124,7 @@ class localprocess(tupleprocess):
 @dataclass
 class networkprocess(tupleprocess):
     number: int
-    connection: SshMachine | ParamikoMachine | SSHConnection | tuple[str, int]
+    connection: SshMachine | ParamikoMachine | SSHConnection | RemoteShell | tuple[str, int]
 
 
 @dataclass
@@ -142,14 +143,15 @@ T = TypeVar("T")
 U = TypeVar("U")
 
 
-def _make_runner(spec):
+def _make_runner(spec, dependency: DependencySpec | None = None):
+    options = {} if dependency is None else {"dependency": dependency}
     match spec:
         case localprocess(number):
-            return ProcessRunner(number)
+            return ProcessRunner(number, **options)
         case networkprocess(number, connection):
-            return NetworkRunner(number, connection)
+            return NetworkRunner(number, connection, **options)
         case proxyprocess(number, host, port, clients, login, remotes):
-            return ProxyRunner(number, host, port, clients, login, remotes)
+            return ProxyRunner(number, host, port, clients, login, remotes, **options)
         case _:
             raise TypeError("Invalid runner descriptor")
 
@@ -163,15 +165,24 @@ class Recursive_RPC:
     def __init__(
         self,
         client: list[localprocess | networkprocess | proxyprocess],
-        conn: Dict[str, Tuple],
+        conn: Dict[str, Tuple] | None = None,
+        dependency: DependencyInput | DependencySpec | None = None,
     ):
+        self.dependency = parse_dependency(dependency).prepared() if dependency is not None else None
         self.client: list[localprocess | networkprocess | proxyprocess] = client
         self.connection: list[None | Runner] = [None for i in range(len(client))]
         self.weight: list[int] = [0 for i in range(len(self.connection))]
-        for index, val in enumerate(client):
-            runner = _make_runner(val)
-            self.weight[index] = runner.process_num
-            self.connection[index] = runner
+        try:
+            for index, val in enumerate(client):
+                runner = _make_runner(val, self.dependency)
+                self.weight[index] = runner.process_num
+                self.connection[index] = runner
+        except BaseException:
+            try:
+                self.__exit__(None, None, None)
+            except Exception:
+                pass
+            raise
         if not any(self.connection):
             raise RuntimeError("No runner")
         # print(len(self.connection))
@@ -180,10 +191,16 @@ class Recursive_RPC:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        for i, c in enumerate(self.connection):
-            if c:
-                c.close()
+        errors = []
+        for connection in self.connection:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception as error:
+                    errors.append(error)
         self.connection.clear()
+        if errors:
+            raise errors[0]
 
     def schedule(self) -> "Runner":
         # start_time = time.time()
@@ -321,11 +338,11 @@ class Runner:
 
 
 class ProcessRunner(Runner):
-    def __init__(self, num: int, printer=print):
+    def __init__(self, num: int, printer=print, dependency: DependencySpec | None = None):
         print("ProcessRunner", num)
         printer("ProcessRunner", num)
 
-        self.pool: "Pool" = Pool(num)
+        self.pool: "Pool" = Pool(num, dependency=dependency)
         self.process_num = self.pool.max_workers
         self.process_handle: list[RPC_Future] = []
 
@@ -351,7 +368,7 @@ class ProcessRunner(Runner):
 
 
 class NetworkRunner(Runner):
-    def __init__(self, num: int, con: SshMachine | ParamikoMachine | SSHConnection | RemoteShell | tuple[str, int]):
+    def __init__(self, num: int, con: SshMachine | ParamikoMachine | SSHConnection | RemoteShell | tuple[str, int], dependency: DependencySpec | None = None):
         self.process_num = num
 
         self.server = None
@@ -363,67 +380,75 @@ class NetworkRunner(Runner):
             case SshMachine() | ParamikoMachine() | RemoteShell():
                 self.machine = con
 
-                # Get uv binary path
-                self.uv_bin = os.fsdecode(find_uv_bin())
-                print(self.uv_bin)
-                if not self._check_uv_available():
-                    raise RuntimeError("uv not installed")
+                if dependency is not None:
+                    self.server = DeployedCrossPlatformServer(
+                        self.machine, server_script=SERVER_SCRIPT[1:],
+                        server_class="rpyc.utils.server.OneShotServer", dependency=dependency,
+                    )
+                else:
+                    # Get uv binary path
+                    self.uv_bin = os.fsdecode(find_uv_bin())
+                    print(self.uv_bin)
+                    if not self._check_uv_available():
+                        raise RuntimeError("uv not installed")
 
-                # Generate requirements and script header
-                header = "#!/usr/bin/env uv run --script\n"
-                curdir = os.getcwd()
+                    # Generate requirements and script header
+                    header = "#!/usr/bin/env uv run --script\n"
+                    curdir = os.getcwd()
 
-                print(curdir)
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    temp_dir = Path(temp_dir)
-                    # Generate requirements.txt using uv
-                    os.chdir(temp_dir)
-                    self._generate_requirements()
+                    print(curdir)
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        temp_dir = Path(temp_dir)
+                        # Generate requirements.txt using uv
+                        os.chdir(temp_dir)
+                        self._generate_requirements()
 
-                    # Create util.py and add dependencies
-                    Path(temp_dir / "util.py").touch()
-                    self._add_script_dependencies()
-                    os.chdir(curdir)
+                        # Create util.py and add dependencies
+                        Path(temp_dir / "util.py").touch()
+                        self._add_script_dependencies()
+                        os.chdir(curdir)
 
-                    # Read and process the generated script
-                    with open(temp_dir / "util.py", "r") as f:
-                        lines = f.read()
-                        # Fix recursiverpc path to use current environment
-                        # TODO: this should be replaced
-                        # use dist or just copy the project
-                        newlines = self._fix_recursiverpc_path(lines)
-                        header += newlines
-                        # header += lines
+                        # Read and process the generated script
+                        with open(temp_dir / "util.py", "r") as f:
+                            lines = f.read()
+                            # Fix recursiverpc path to use current environment
+                            # TODO: this should be replaced
+                            # use dist or just copy the project
+                            newlines = self._fix_recursiverpc_path(lines)
+                            header += newlines
+                            # header += lines
 
-                server_script_user = header + "\n" + SERVER_SCRIPT[1:]
-                extra_setup = ""
-                print(server_script_user)
+                    server_script_user = header + "\n" + SERVER_SCRIPT[1:]
+                    extra_setup = ""
+                    print(server_script_user)
 
-                major = sys.version_info[0]
-                minor = sys.version_info[1]
+                    major = sys.version_info[0]
+                    minor = sys.version_info[1]
 
-                # Use uv run with script mode
-                self.uv_bin = os.path.relpath(os.fsdecode(find_uv_bin()), os.getcwd())
-                # TODO: fix this, shell name is leaking
-                executable = [
-                    "uv",
-                    "run",
-                    "-q",
-                    "--python",
-                    f"{major}.{minor}",
-                    "--script",
-                ]
-                # executable = ["uv.exe", "run", "-q", "--python", f"{major}.{minor}", "--script"]
-                self.server = DeployedCrossPlatformServer(
-                    self.machine,
-                    server_script=server_script_user,
-                    extra_setup=extra_setup,
-                    server_class="rpyc.utils.server.OneShotServer",
-                    python_executable=executable,
-                )
+                    # Use uv run with script mode
+                    self.uv_bin = os.path.relpath(os.fsdecode(find_uv_bin()), os.getcwd())
+                    # TODO: fix this, shell name is leaking
+                    executable = [
+                        "uv",
+                        "run",
+                        "-q",
+                        "--python",
+                        f"{major}.{minor}",
+                        "--script",
+                    ]
+                    # executable = ["uv.exe", "run", "-q", "--python", f"{major}.{minor}", "--script"]
+                    self.server = DeployedCrossPlatformServer(
+                        self.machine,
+                        server_script=server_script_user,
+                        extra_setup=extra_setup,
+                        server_class="rpyc.utils.server.OneShotServer",
+                        python_executable=executable,
+                    )
 
                 self.conn = self.server.classic_connect()
             case (hostname, port):
+                if dependency is not None:
+                    raise ValueError("dependency requires a managed worker, not an existing RPC server")
                 self.conn = rpyc.classic.connect(hostname, port=port)
             case _:
                 raise RuntimeError("Invalid connection")
@@ -595,6 +620,7 @@ class ProxyRunner(Runner):
         clientlist: list[localprocess | networkprocess | proxyprocess],
         ssh_login: Tuple | None = None,
         ssh_remote: Dict[str, Tuple] | None = None,
+        dependency: DependencySpec | None = None,
     ):
         self.host = host
         self.port = port
@@ -610,7 +636,7 @@ class ProxyRunner(Runner):
         try:
             if host is None:
                 for spec in clientlist:
-                    runner = _make_runner(spec)
+                    runner = _make_runner(spec, dependency)
                     self.connection.append(runner)
                     self.weight.append(runner.process_num)
                     self.process_num += runner.process_num
@@ -623,13 +649,17 @@ class ProxyRunner(Runner):
                 self._gateway = NetworkRunner(1, SSHConnection(
                     host, user=user, port=port if port is not None else 22,
                     password=password,
-                ))
+                ), **({} if dependency is None else {"dependency": dependency}))
                 self.conn = self._gateway.conn
                 if self.conn is None:
                     raise RuntimeError("Gateway did not establish an RPC connection")
                 remote = self.conn.modules.recursiverpc
                 specs = [self._copy_spec(remote, spec) for spec in clientlist]
-                self._remote_proxy = remote.ProxyRunner(num, None, None, specs)
+                options = {}
+                if dependency is not None:
+                    remote_dependency = self.conn.modules["recursiverpc.dependencies"].DependencySpec(*dependency.payload())
+                    options["dependency"] = remote_dependency
+                self._remote_proxy = remote.ProxyRunner(num, None, None, specs, **options)
                 self.process_num = self._remote_proxy.process_num
         except BaseException:
             try:
@@ -714,7 +744,7 @@ class ProxyRunner(Runner):
 
 
 class Pool:
-    def __init__(self, max_workers: int, offset: int = 0):
+    def __init__(self, max_workers: int, offset: int = 0, dependency: DependencySpec | None = None):
         import multiprocessing
 
         self.max_workers = (
@@ -722,12 +752,19 @@ class Pool:
         )
         self.scheduler = []
 
-        # print("Connecting")
-        for _ in range(self.max_workers):
-            conn = rpyc.classic.connect_multiprocess()
-            conn.modules.sys.stdout = sys.stdout
-            conn.modules.sys.stderr = sys.stderr
-            self.scheduler.append(conn)
+        self._project = None
+        try:
+            if dependency is not None:
+                self._project = LocalProject(dependency)
+            for _ in range(self.max_workers):
+                conn = (self._project.connect() if self._project is not None
+                        else rpyc.classic.connect_multiprocess())
+                self.scheduler.append(conn)
+                conn.modules.sys.stdout = sys.stdout
+                conn.modules.sys.stderr = sys.stderr
+        except BaseException:
+            self.close()
+            raise
 
         self.scheduler_index = 0
         self.scheduler_status: list[bool] = [False] * self.max_workers
@@ -794,8 +831,22 @@ class Pool:
         return result_future
 
     def close(self):
-        for i in self.scheduler:
-            i.close()
+        errors = []
+        for connection in self.scheduler:
+            try:
+                connection.close()
+            except Exception as error:
+                errors.append(error)
+        self.scheduler.clear()
+        if self._project is not None:
+            try:
+                self._project.close()
+            except Exception as error:
+                errors.append(error)
+            finally:
+                self._project = None
+        if errors:
+            raise errors[0]
 
     def __del__(self):
         self.close()
@@ -813,6 +864,7 @@ class DeployedCrossPlatformServer(DeployedServer):
         server_script=SERVER_SCRIPT,
         extra_setup="",
         python_executable=None,
+        dependency: DependencySpec | None = None,
     ) -> None:
         self.proc = None
         self.tun = None
@@ -821,28 +873,34 @@ class DeployedCrossPlatformServer(DeployedServer):
         remote_machine = shell_aware(remote_machine)
         self.remote_machine = remote_machine
 
-        # print(python_executable)
-        if isinstance(python_executable, (list, tuple)):
-            cmd = remote_machine.command(python_executable[0])
-            for part in python_executable[1:]:
-                cmd = cmd[part]
-        elif isinstance(python_executable, BoundCommand):
-            arguments = []
-            while isinstance(python_executable, BoundCommand):
-                arguments = list(python_executable.args) + arguments
-                python_executable = python_executable.cmd
-            cmd = remote_machine.command(str(python_executable.executable))[tuple(arguments)]
-        elif python_executable:
-            cmd = remote_machine.command(python_executable)
-        else:
-            cmd = remote_machine.command("uv")[
-                "run", "-q", "--", "python"
-            ]
-
         self._tmpdir_ctx = CrossPlatformTempDir(remote_machine)
         tmp = self._tmpdir_ctx.__enter__()
-
         try:
+            if dependency is not None:
+                dependency.install_remote(remote_machine, tmp)
+                environment = tmp.rstrip('/\\') + '/.venv'
+                cmd = remote_machine.command("uv").with_env(
+                    UV_PROJECT_ENVIRONMENT=environment, VIRTUAL_ENV=None,
+                )["run", "--project", tmp, "--no-sync", "--no-dev", "python", "-u"]
+            else:
+                # print(python_executable)
+                if isinstance(python_executable, (list, tuple)):
+                    cmd = remote_machine.command(python_executable[0])
+                    for part in python_executable[1:]:
+                        cmd = cmd[part]
+                elif isinstance(python_executable, BoundCommand):
+                    arguments = []
+                    while isinstance(python_executable, BoundCommand):
+                        arguments = list(python_executable.args) + arguments
+                        python_executable = python_executable.cmd
+                    cmd = remote_machine.command(str(python_executable.executable))[tuple(arguments)]
+                elif python_executable:
+                    cmd = remote_machine.command(python_executable)
+                else:
+                    cmd = remote_machine.command("uv")[
+                        "run", "-q", "--", "python"
+                    ]
+
             server_modname, server_clsname = server_class.rsplit(".", 1)
             service_modname, service_clsname = service_class.rsplit(".", 1)
 

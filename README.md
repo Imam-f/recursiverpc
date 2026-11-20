@@ -19,6 +19,63 @@ dependency
     ssh
     dill
 
+## Worker dependencies
+
+`Recursive_RPC(..., dependency=...)` creates isolated temporary uv projects for
+local workers, SSH workers, and proxy gateways/children. Packages are installed
+before work starts. The caller's environment is unchanged, and temporary projects
+are removed when the pool closes. Keep the pool in a `with` block for cleanup.
+
+```python
+from pathlib import Path
+from recursiverpc import Recursive_RPC, localprocess
+
+def task(value):
+    import humanize
+    return humanize.intcomma(value)
+
+if __name__ == "__main__":
+    with Recursive_RPC(
+        [localprocess(2)],
+        dependency=["humanize==4.11.0"],
+    ) as pool:
+        print(pool.apply(task, 1234567))
+```
+
+The `dependency` argument accepts:
+
+```python
+dependency = ["numpy>=1.25,<3", "requests"]  # package requirement strings
+dependency = "numpy>=1.25,<3, requests"      # comma-separated requirements
+dependency = Path("pyproject.toml")         # also accepts a string file path
+dependency = """# /// script
+# requires-python = ">=3.10"
+# dependencies = ["humanize==4.11.0"]
+# ///
+"""
+```
+
+Lists may also contain imported module objects; their installed distribution
+names are resolved automatically, and standard-library module objects are skipped.
+For imports whose package name differs from the import name, use the distribution
+name (for example `Pillow`) or the imported module object (`PIL`). A `.py` file
+containing a uv header is also accepted.
+
+For a pyproject input, runtime `[project].dependencies`, Python constraints, and
+uv sources/index configuration are used. The caller's project itself and dev
+dependency groups are not installed. Relative source paths are resolved relative
+to that pyproject; external local sources must also be accessible on remote hosts.
+The worker's Python requirement must be compatible with this library's supported
+Python version. Dependency-resolution or installation errors stop pool creation.
+
+The recursiverpc framework is bundled into each explicit dependency project as a
+wheel, so SSH workers do not need the framework checkout at the caller's path.
+The initial caller currently needs the source checkout to build that wheel.
+Omitting `dependency` retains the existing behavior; `dependency=[]` requests an
+isolated project containing only recursiverpc and its runtime dependencies.
+Existing RPC `(host, port)` connections cannot be reconfigured with dependencies;
+use a managed `SSHConnection` worker to create a new environment.
+
 ## SSH login shells
 
 Deployment supports Linux Bash, Windows Git Bash, Windows PowerShell, and Windows
