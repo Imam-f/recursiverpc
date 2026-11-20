@@ -55,8 +55,31 @@ require Bash. Git Bash and Linux Bash both use the `bash` override.
 
 Shell support does not copy your project or its local dependencies to another
 computer. The existing editable dependency paths must be accessible remotely.
-For cmd, literal `%`, `!`, and newlines in executable arguments are rejected to
-prevent command expansion; script contents are encoded and can contain them.
+Windows command arguments are forwarded through Python's subprocess API to
+preserve quotes and shell-sensitive characters without another shell parse.
+
+### Adapting an existing Plumbum connection
+
+```python
+from recursiverpc import shell_aware
+
+remote = shell_aware(machine, shell="auto")  # an existing SshMachine/ParamikoMachine
+uv = remote["uv"]
+print(uv["--version"]())
+```
+
+The adapter returns standard Plumbum `RemoteCommand` and `BoundCommand` objects.
+Argument binding, `.run(retcode=..., timeout=...)`, `.with_env(...)`, and
+`.with_cwd(...)` use Plumbum's command APIs. Only command discovery and shell
+execution are adapted for this connection; no Plumbum classes or other SSH
+connections are modified. Reapplying `shell_aware()` returns the same adapter.
+The original connection remains available as `remote.machine`, including its
+file-transfer and tunneling APIs.
+
+Native Windows connections should still start with `SSHConnection`, since an
+ordinary Plumbum connection may run POSIX probes before it can be adapted.
+`SSHConnection.connect()` returns the same adapter type, `ShellAwareMachine`.
+The earlier `RemoteShell` name remains an alias for compatibility.
 
 Run the isolated regression tests (without SSH credentials):
 

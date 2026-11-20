@@ -8,7 +8,10 @@ import subprocess
 import sys
 import unittest
 
-from recursiverpc.ssh import RemoteShell, shell_command
+from recursiverpc.ssh import RemoteShell, shell_aware
+from plumbum.commands import ProcessExecutionError
+from plumbum.machines.remote import RemoteCommand
+from plumbum.machines.local import PlumbumLocalPopen
 from recursiverpc.recursiverpc import DeployedCrossPlatformServer
 
 
@@ -21,7 +24,7 @@ class LocalShell(RemoteShell):
         # Use the direct socket path; these tests do not open RPC sockets.
         self.client = object()
 
-    def popen(self, command):
+    def _popen_shell(self, command):
         if self.kind == 'gitbash':
             args = ['C:/Program Files/Git/bin/bash.exe', '-c', command]
         elif self.kind == 'linux':
@@ -32,14 +35,15 @@ class LocalShell(RemoteShell):
         else:
             # /s strips this outer pair, leaving the quoted executable intact.
             args = 'cmd.exe /d /s /c "' + command + '"'
-        return subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, env=self.env)
+        return PlumbumLocalPopen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, env=self.env)
 
 
 class CrossShellTests(unittest.TestCase):
     def check_shell(self, kind, expected):
         remote = LocalShell(kind)
         self.assertEqual(remote.shell, expected)
+        self.assertIs(shell_aware(remote), remote)
         directory = remote.make_temp_dir()
         try:
             # This exceeds cmd's command-line limit if embedded in the command.
@@ -51,7 +55,22 @@ class CrossShellTests(unittest.TestCase):
             self.assertEqual(bytes.fromhex(json.loads(readback)), content.encode('utf-8'))
             executable = json.loads(remote.python_run('import sys,json; print(json.dumps(sys.executable))'))
             command = remote.command(executable)
+            self.assertIsInstance(command, RemoteCommand)
             self.assertEqual(command('-c', 'print(42)').strip(), '42')
+            # Exercise Plumbum's own binding/run/error interfaces, not a copy.
+            argument = 'quote \' " & | $ % !\nsecond line'
+            bound = command['-c']['import sys;print(sys.argv[1])'][argument]
+            self.assertEqual(bound().replace('\r\n', '\n').strip(), argument)
+            code, output, error = command.run(['-c', 'print(17)'])
+            self.assertEqual((code, output.strip(), error), (0, '17', ''))
+            with self.assertRaises(ProcessExecutionError):
+                command('-c', 'import sys;sys.exit(7)')
+            self.assertEqual(command.run(['-c', 'import sys;sys.exit(7)'], retcode=7)[0], 7)
+            configured = command.with_env(RRPC_TEST_VALUE='unicode 雪 & quotes \' "')
+            output = configured('-c', 'import os,json;print(json.dumps(os.environ[\'RRPC_TEST_VALUE\']))')
+            self.assertEqual(json.loads(output), 'unicode 雪 & quotes \' "')
+            output = command.with_cwd(directory)('-c', 'import os,json;print(json.dumps(os.getcwd()))')
+            self.assertEqual(json.loads(output), directory)
         finally:
             remote.remove_temp_dir(directory)
         self.assertEqual(remote.python_run('import os; print(os.path.exists(' + repr(directory) + '))'), 'False')

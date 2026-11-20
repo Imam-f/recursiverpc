@@ -5,7 +5,10 @@ import io
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 from plumbum.commands import CommandNotFound
-from recursiverpc.ssh import RemoteShell, shell_command
+from recursiverpc.ssh import RemoteShell, ShellAwareMachine, shell_aware, shell_command
+from plumbum.machines.paramiko_machine import ParamikoMachine, ParamikoPopen
+from plumbum.machines.ssh_machine import SshMachine
+from recursiverpc.ssh import SSHProcess
 rpc = importlib.import_module("recursiverpc.recursiverpc")
 
 class RemoteCommandTests(unittest.TestCase):
@@ -18,11 +21,11 @@ class RemoteCommandTests(unittest.TestCase):
 
     def test_windows_bash_path_uses_forward_slashes(self):
         remote = self.remote("bash", r"C:\Users\User Name\uv.exe")
-        self.assertEqual(remote.command("uv").argv, ["C:/Users/User Name/uv.exe"])
+        self.assertEqual(str(remote.command("uv").executable), "C:/Users/User Name/uv.exe")
 
     def test_linux_bash_preserves_native_path(self):
         remote = self.remote("bash", "/usr/local/bin/uv")
-        self.assertEqual(remote.command("uv").argv, ["/usr/local/bin/uv"])
+        self.assertEqual(str(remote.command("uv").executable), "/usr/local/bin/uv")
 
     def test_missing_executable_raises(self):
         with self.assertRaises(CommandNotFound):
@@ -31,6 +34,32 @@ class RemoteCommandTests(unittest.TestCase):
     def test_cmd_rejects_variable_expansion_in_arguments(self):
         with self.assertRaises(ValueError):
             shell_command(["python", "%SECRET%"], "cmd")
+
+    def test_adapter_does_not_patch_other_connections_or_upstream_classes(self):
+        first = MagicMock(spec=ParamikoMachine)
+        second = MagicMock(spec=ParamikoMachine)
+        first_popen, second_popen = first.popen, second.popen
+        paramiko_popen, ssh_popen = ParamikoMachine.popen, SshMachine.popen
+        with patch.object(ShellAwareMachine, "run", return_value=(0, "731029", "")), \
+             patch.object(ShellAwareMachine, "python_run", return_value='["nt", "C:/Python/python.exe"]'):
+            adapted = shell_aware(first, shell="cmd")
+            other = shell_aware(second, shell="powershell")
+        self.assertIs(adapted.machine, first)
+        self.assertIs(other.machine, second)
+        self.assertEqual(adapted.shell, "cmd")
+        self.assertEqual(other.shell, "powershell")
+        self.assertIs(shell_aware(adapted), adapted)
+        self.assertIs(first.popen, first_popen)
+        self.assertIs(second.popen, second_popen)
+        self.assertIs(ParamikoMachine.popen, paramiko_popen)
+        self.assertIs(SshMachine.popen, ssh_popen)
+        self.assertTrue(issubclass(SSHProcess, ParamikoPopen))
+        with self.assertRaises(ValueError):
+            shell_aware(adapted, shell="bash")
+        with adapted:
+            pass
+        first.close.assert_called_once()
+        second.close.assert_not_called()
 
     def test_failed_initialization_can_clean_up_without_missing_attributes(self):
         runner = rpc.NetworkRunner.__new__(rpc.NetworkRunner)

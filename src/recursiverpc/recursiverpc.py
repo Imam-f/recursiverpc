@@ -23,7 +23,7 @@ from plumbum import SshMachine
 from plumbum.commands import CommandNotFound, ProcessExecutionError
 from plumbum.commands.base import BoundCommand
 from plumbum.machines.paramiko_machine import ParamikoMachine
-from .ssh import SSHConnection, RemoteShell
+from .ssh import SSHConnection, RemoteShell, shell_aware
 
 old_print = print
 
@@ -882,8 +882,7 @@ class DeployedCrossPlatformServer(DeployedServer):
         self.tun = None
         self.remote_machine = remote_machine
         self._tmpdir_ctx = None
-        remote_machine = (remote_machine if isinstance(remote_machine, RemoteShell)
-                          else RemoteShell(remote_machine))
+        remote_machine = shell_aware(remote_machine)
         self.remote_machine = remote_machine
 
         # print(python_executable)
@@ -945,11 +944,10 @@ class DeployedCrossPlatformServer(DeployedServer):
             raise
 
     def _write_server_script(self, remote_machine, tmp_dir, server_script):
-        remote = (remote_machine if isinstance(remote_machine, RemoteShell)
-                  else RemoteShell(remote_machine))
+        remote = shell_aware(remote_machine)
         return remote.write_script(tmp_dir, server_script)
 
-    def close(self, timeout=10):
+    def close(self, timeout: int | None = 10):
         if self.proc is not None:
             try:
                 self.proc.terminate()
@@ -1025,7 +1023,7 @@ class CrossPlatformTempDir:
 
     def __enter__(self):
         if not isinstance(self.remote_machine, RemoteShell):
-            self.remote_machine = RemoteShell(self.remote_machine)
+            self.remote_machine = shell_aware(self.remote_machine)
         self.path = self.remote_machine.make_temp_dir()
         return self.path
 

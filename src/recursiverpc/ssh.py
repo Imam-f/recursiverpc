@@ -9,6 +9,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import paramiko
 from plumbum.commands import CommandNotFound, ProcessExecutionError
+from plumbum.commands.base import BaseCommand, BoundCommand
+from plumbum.machines.remote import RemoteCommand
+from plumbum.machines.paramiko_machine import ParamikoPopen
 
 
 def shell_command(argv, shell):
@@ -54,23 +57,22 @@ class SSHConnection:
                            password=self.password, key_filename=self.key_filename,
                            timeout=self.timeout, auth_timeout=self.timeout,
                            banner_timeout=self.timeout)
-            return RemoteShell(client, shell=self.shell, timeout=self.timeout)
+            return shell_aware(client, shell=self.shell, timeout=self.timeout)
         except BaseException:
             client.close()
             raise
 
 
-class SSHProcess:
-    def __init__(self, client, command):
-        self.argv = [command]
-        self.stdin, self.stdout, self.stderr = client.exec_command(command)
-        self.channel = self.stdout.channel
-        self.returncode = None
+class SSHProcess(ParamikoPopen):
+    """Plumbum's Paramiko process with binary input and graceful server shutdown.
 
-    def poll(self):
-        if self.channel.exit_status_ready():
-            self.returncode = self.channel.recv_exit_status()
-        return self.returncode
+    The upstream communicate() has no input/timeout arguments and reads streams
+    serially, so retain the small override needed for script uploads.
+    """
+
+    def __init__(self, client, command):
+        stdin, stdout, stderr = client.exec_command(command)
+        super().__init__([command], stdin, stdout, stderr, "utf-8")
 
     def terminate(self):
         # The bootstrap server waits on stdin. EOF requests graceful shutdown.
@@ -94,33 +96,19 @@ class SSHProcess:
             except TimeoutError:
                 self.kill()
                 raise subprocess.TimeoutExpired(self.argv, timeout)
-        self.returncode = self.channel.recv_exit_status()
-        self.channel.close()
+        self.wait()
         return result
 
 
-class RemoteCommand:
-    def __init__(self, remote, argv):
-        self.remote = remote
-        self.argv = list(argv)
+class ShellAwareMachine:
+    """Connection-scoped adapter returning ordinary Plumbum remote commands.
 
-    def __getitem__(self, args):
-        if not isinstance(args, tuple):
-            args = (args,)
-        return RemoteCommand(self.remote, self.argv + list(args))
+    Raw SSH transport bypasses Plumbum's POSIX initialization and cd/env prefix;
+    command binding, execution, return-code checking, and process helpers remain
+    Plumbum's. No upstream classes or other connections are monkey patched.
+    """
 
-    def popen(self, *args, **kwargs):
-        return self.remote.popen(shell_command(self.argv + list(args), self.remote.shell))
-
-    def __call__(self, *args):
-        code, stdout, stderr = self.remote.run(shell_command(self.argv + list(args), self.remote.shell))
-        if code:
-            raise ProcessExecutionError(self.argv, code, stdout, stderr)
-        return stdout
-
-
-class RemoteShell:
-    """Wrap Paramiko clients or existing Plumbum SSH machines using raw exec."""
+    custom_encoding = "utf-8"
 
     def __init__(self, machine, shell="auto", timeout=15):
         self.machine = machine
@@ -153,12 +141,50 @@ class RemoteShell:
                 break
         if self.python is None:
             raise RuntimeError("Remote Python 3.10+ is required (python3, python, py -3, or uv)")
+        self.platform, executable = json.loads(self.python_run(
+            "import os,sys,json; print(json.dumps([os.name,sys.executable]))"
+        ))
+        if self.shell == "bash" and re.match(r"^[A-Za-z]:", executable):
+            executable = executable.replace("\\", "/")
+        self.python = [executable]
 
-    def popen(self, command):
+    def _popen_shell(self, command):
         if self.client is not None:
             return SSHProcess(self.client, command)
         # Bypass Plumbum's POSIX cd/env prefix and argument quoting.
         return self.machine._ssh_command[self.machine._fqhost, command].popen()
+
+    def popen(self, command, *, new_session=False, cwd=None, env=None):
+        if isinstance(command, BaseCommand):
+            # Unwrap binding before formulation so Plumbum does not apply its
+            # POSIX quoting. The selected shell quotes the resulting argv once.
+            arguments = []
+            while isinstance(command, BoundCommand):
+                arguments = command.args + arguments
+                command = command.cmd
+            argv = command.formulate(args=arguments)
+            if self.platform == "nt" or cwd is not None or env:
+                # Windows PowerShell 5 and cmd cannot faithfully forward every
+                # quoted native argument. Relay argv through Python's subprocess
+                # API without another shell parse. The child inherits stdio.
+                script = "import os,subprocess,sys; "
+                if cwd is not None:
+                    script += "os.chdir(" + repr(str(cwd)) + "); "
+                for name, value in (env or {}).items():
+                    if value is None:
+                        script += "os.environ.pop(" + repr(name) + ", None); "
+                    else:
+                        script += "os.environ[" + repr(name) + "]=" + repr(str(value)) + "; "
+                script += "sys.exit(subprocess.call(" + repr(argv) + "))"
+                command = self._python_command(script)
+            else:
+                command = shell_command(argv, self.shell)
+        elif cwd is not None or env:
+            raise TypeError("cwd/env require a Plumbum command, not raw shell text")
+        proc = self._popen_shell(command)
+        proc.custom_encoding = self.custom_encoding
+        proc.argv = [command]
+        return proc
 
     def run(self, command, input=None):
         proc = self.popen(command)
@@ -168,16 +194,19 @@ class RemoteShell:
         return proc.returncode, text(stdout), text(stderr)
 
     def python_run(self, script, input=None):
-        # No user text, paths, or script contents are interpolated into shell syntax.
-        encoded = script.encode("utf-8").hex()
-        expression = "exec(bytes.fromhex('" + encoded + "').decode('utf-8'))"
-        command = shell_command(self.python + ["-c", expression], self.shell)
+        command = self._python_command(script)
         code, stdout, stderr = self.run(command, input=input)
         if code:
             raise ProcessExecutionError(self.python, code, stdout, stderr)
         return stdout.strip()
 
-    def command(self, executable):
+    def _python_command(self, script):
+        # No user text, paths, or script contents are interpolated into shell syntax.
+        encoded = script.encode("utf-8").hex()
+        expression = "exec(bytes.fromhex('" + encoded + "').decode('utf-8'))"
+        return shell_command(self.python + ["-c", expression], self.shell)
+
+    def which(self, executable):
         path = json.loads(self.python_run(
             "import json,shutil; print(json.dumps(shutil.which(" + repr(executable) + ")))"
         ))
@@ -185,7 +214,12 @@ class RemoteShell:
             raise CommandNotFound(executable, [])
         if self.shell == "bash" and re.match(r"^[A-Za-z]:", path):
             path = path.replace("\\", "/")
-        return RemoteCommand(self, [path])
+        return path
+
+    def command(self, executable):
+        return RemoteCommand(self, self.which(str(executable)))
+
+    __getitem__ = command
 
     def make_temp_dir(self):
         return json.loads(self.python_run(
@@ -213,3 +247,26 @@ class RemoteShell:
 
     def close(self):
         self.machine.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def shell_aware(machine, shell="auto", timeout=15):
+    """Adapt one existing SSH machine/client; leave other connections unchanged.
+
+    Use SSHConnection for native Windows shells, before Plumbum's POSIX probes
+    could run. Reapplying this function to an adapter returns that adapter.
+    """
+    if isinstance(machine, ShellAwareMachine):
+        if shell not in ("auto", machine.shell):
+            raise ValueError("Connection is already adapted for a different shell")
+        return machine
+    return ShellAwareMachine(machine, shell=shell, timeout=timeout)
+
+
+# Preserve the name used by the initial implementation and downstream callers.
+RemoteShell = ShellAwareMachine
