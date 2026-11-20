@@ -1,6 +1,7 @@
 from recursiverpc import Recursive_RPC, localprocess, networkprocess, proxyprocess, RPC_Future
 import time
 import os
+import subprocess
 from dotenv import load_dotenv
 load_dotenv()
 import traceback
@@ -68,7 +69,7 @@ def main():
         print(ls_cmd())
     except Exception as e:
         print(e)
-    print(os.system("asdfhjk"), os.system("pwd"))
+    print(subprocess.call("asdfhjk", shell=True), subprocess.call("pwd", shell=True))
     
     print("================")
     sshmachine.close()

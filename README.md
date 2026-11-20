@@ -81,6 +81,30 @@ ordinary Plumbum connection may run POSIX probes before it can be adapted.
 `SSHConnection.connect()` returns the same adapter type, `ShellAwareMachine`.
 The earlier `RemoteShell` name remains an alias for compatibility.
 
+### Proxy gateways
+
+`proxyprocess` can group workers locally (`host=None`) or deploy that group on an
+SSH gateway. Gateway setup now uses the same `NetworkRunner` and shell adapter
+as ordinary SSH workers; RPC ports are allocated automatically.
+
+```python
+from recursiverpc import localprocess, proxyprocess
+
+gateway = proxyprocess(
+    1, "gateway.example.com", 22,
+    [localprocess(2)],
+    ("worker", None),  # SSH user/password; None allows key authentication
+    {},
+)
+```
+
+The proxy's first number is retained for compatibility; its capacity is the sum
+of its child workers. Child network descriptors use
+`networkprocess(number, SSHConnection(...))` or an existing RPC `(host, port)`
+tuple. SSH hostnames, key paths, and known_hosts for these children are resolved
+on the gateway. Live local SSH machine objects cannot be copied to a gateway.
+Local proxy groups can also contain nested proxy groups.
+
 Run the isolated regression tests (without SSH credentials):
 
 ```powershell

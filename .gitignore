@@ -1,2 +1,6 @@
 .env*
 traceback*
+*.pyc
+.venv
+dist
+__pycache__

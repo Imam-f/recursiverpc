@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Tuple
 from typing import Generator, TypeVar, Callable, Any, Dict, Generic
 import os
@@ -75,9 +77,35 @@ if __name__ == "__main__":
 
     sys.stdout.write(f"{t.port}\n")
     sys.stdout.flush()
+
+    def watch_shutdown():
+        # Some SSH/uv launchers expose EOF immediately. EOF is not evidence
+        # that the RPC connection has ended, so only an explicit token stops us.
+        # Read the fd directly: a daemon must not hold stdin's buffered IO lock
+        # when OneShotServer exits after its client disconnects.
+        pending = b""
+        token = b"__recursiverpc_shutdown__\n"
+        try:
+            while True:
+                chunk = os.read(sys.stdin.fileno(), 1024)
+                if not chunk:
+                    return
+                pending += chunk
+                if token in pending:
+                    t.close()
+                    return
+                pending = pending[-len(token):]
+        except (OSError, ValueError):
+            return
+
+    import threading
+    threading.Thread(target=watch_shutdown, daemon=True).start()
     try:
-        sys.stdin.read()
+        # Returning from main would begin Python's threading/futures shutdown
+        # even if worker or SSH threads keep the process alive.
+        thd.join()
     finally:
+        t.close()
         thd.join(2)
 """
 
@@ -103,7 +131,7 @@ class proxyprocess(tupleprocess):
     number: int
     host: str | None
     port: int | None
-    client: list["localprocess | networkprocess | proxyprocess"]
+    client: list[localprocess | networkprocess | "proxyprocess"]
     ssh_login: Tuple
     ssh_remote: Dict[str, Tuple]
 
@@ -112,6 +140,18 @@ class proxyprocess(tupleprocess):
 
 T = TypeVar("T")
 U = TypeVar("U")
+
+
+def _make_runner(spec):
+    match spec:
+        case localprocess(number):
+            return ProcessRunner(number)
+        case networkprocess(number, connection):
+            return NetworkRunner(number, connection)
+        case proxyprocess(number, host, port, clients, login, remotes):
+            return ProxyRunner(number, host, port, clients, login, remotes)
+        case _:
+            raise TypeError("Invalid runner descriptor")
 
 
 class Recursive_RPC:
@@ -129,15 +169,7 @@ class Recursive_RPC:
         self.connection: list[None | Runner] = [None for i in range(len(client))]
         self.weight: list[int] = [0 for i in range(len(self.connection))]
         for index, val in enumerate(client):
-            match val:
-                case localprocess(i):
-                    runner = ProcessRunner(i)
-                case networkprocess(i, j):
-                    runner = NetworkRunner(i, j)
-                case proxyprocess(i, j, k, l, m, n):
-                    runner = ProxyRunner(i, j, k, l, m, n)
-                case _:
-                    raise TypeError
+            runner = _make_runner(val)
             self.weight[index] = runner.process_num
             self.connection[index] = runner
         if not any(self.connection):
@@ -553,225 +585,129 @@ class NetworkRunner(Runner):
 
 
 class ProxyRunner(Runner):
+    """Group runners locally, or bootstrap the same group on an SSH gateway."""
+
     def __init__(
         self,
         num: int,
-        host: str,
-        port: int,
+        host: str | None,
+        port: int | None,
         clientlist: list[localprocess | networkprocess | proxyprocess],
         ssh_login: Tuple | None = None,
-        ssh_remote: Dict[str, Tuple] = {},
+        ssh_remote: Dict[str, Tuple] | None = None,
     ):
         self.host = host
         self.port = port
         self.num = num
         self.ssh_login = ssh_login
-
-        self.stop = None
-        if host is not None:
-            user, password = (
-                self.ssh_login if self.ssh_login is not None else ("root", "")
-            )
-            self.stop = activate_ssh(self.host, user, self.port, password, num)
-
-            self.conn = rpyc.classic.connect(host, port=num)
-            self.conn.execute("import recursive_rpc as rp")
-            self.conn.execute("import dill")
-            self.conn.execute("dill.settings['recurse'] = True")
-            self.conn.execute("runner_list = []")
-
-        self.process_num: int = 0
+        self.process_num = 0
         self.weight: list[int] = []
         self.connection: list[Runner] = []
         self.process_handle: list[RPC_Future] = []
+        self.conn = None
+        self._gateway = None
+        self._remote_proxy = None
+        try:
+            if host is None:
+                for spec in clientlist:
+                    runner = _make_runner(spec)
+                    self.connection.append(runner)
+                    self.weight.append(runner.process_num)
+                    self.process_num += runner.process_num
+                if not self.connection:
+                    raise RuntimeError("No runner")
+            else:
+                user, password = ssh_login if ssh_login is not None else (None, None)
+                # Reuse the existing deployment, dependency setup, forwarding,
+                # and connection cleanup instead of the removed activate_ssh API.
+                self._gateway = NetworkRunner(1, SSHConnection(
+                    host, user=user, port=port if port is not None else 22,
+                    password=password,
+                ))
+                self.conn = self._gateway.conn
+                if self.conn is None:
+                    raise RuntimeError("Gateway did not establish an RPC connection")
+                remote = self.conn.modules.recursiverpc
+                specs = [self._copy_spec(remote, spec) for spec in clientlist]
+                self._remote_proxy = remote.ProxyRunner(num, None, None, specs)
+                self.process_num = self._remote_proxy.process_num
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
-        self.drop_list = []
-
-        for index, val in enumerate(clientlist):
-            match val:
-                case localprocess(i):
-                    print("Here3")
-                    if host is not None:
-                        self.conn.execute(
-                            "runner_list.append(rp.ProcessRunner(" + str(i) + "))"
+    @classmethod
+    def _copy_spec(cls, remote, spec):
+        """Build native descriptors on the gateway, rather than local netrefs."""
+        match spec:
+            case localprocess(number):
+                return remote.localprocess(number)
+            case networkprocess(number, connection):
+                if isinstance(connection, SSHConnection):
+                    policy = connection.missing_host_policy
+                    if policy is not None:
+                        raise TypeError(
+                            "Gateway SSHConnection must use the gateway's known_hosts policy"
                         )
-                        runner = self.conn.namespace["runner_list"][-1]
-                    else:
-                        runner = ProcessRunner(i)
-                case networkprocess(i, j, k, l):
-                    if host is not None:
-                        if callable(l):
-                            self.drop_list.append(l)
-                            func_name = "None"
-                            print("Here2")
-                        else:
-                            # create ssh connection
-                            # stop = activate_ssh(HOSTNAME,
-                            #     USER,
-                            #     PORT,
-                            #     PASSWORD,
-                            #     remote_port)
-                            print("Here")
-                            HOSTNAME, USER, PORT, PASSWORD, remote_port = ssh_remote[l]
-                            # check if user has double backslashes
-                            # if "\\" in USER:
-                            #     USER = USER.replace("\\", "\\\\")
-                            # print("stop = rp.activate_ssh(\"" + str(HOSTNAME) + \
-                            #                   "\", \"" + str(USER) + \
-                            #                   "\", " + str(PORT) + \
-                            #                   ", \"" + str(PASSWORD) +\
-                            #                   "\"," + str(remote_port) + ")")
-                            if "\\\\" in USER:
-                                USER = USER.replace("\\\\", "\\")
-                            self.conn.namespace["HOSTNAME"] = HOSTNAME
-                            self.conn.namespace["USER"] = USER
-                            self.conn.namespace["PORT"] = PORT
-                            self.conn.namespace["PASSWORD"] = PASSWORD
-                            self.conn.namespace["remote_port"] = remote_port
-                            print(
-                                f"HOSTNAME: {HOSTNAME}, USER: {USER}, PORT: {PORT}, PASSWORD: {PASSWORD}, remote_port: {remote_port}"
-                            )
-                            print(self.conn.namespace["HOSTNAME"])
-                            print(self.conn.namespace["USER"])
-                            print(self.conn.namespace["PORT"])
-                            print(self.conn.namespace["PASSWORD"])
-                            print(self.conn.namespace["remote_port"])
-                            print("Here2")
-                            # self.conn.execute("stop = rp.activate_ssh(HOSTNAME, USER, PORT, PASSWORD, remote_port)")
-                            # with rpyc.classic.redirected_stdio(self.conn):
-                            #     from textwrap import dedent
-                            #     command = dedent("""
-                            #                     print("hello")
-                            #                     try:
-                            #                         stop = rp.activate_ssh(HOSTNAME, USER, PORT, PASSWORD, remote_port)
-                            #                         print(stop)
-                            #                     except Exception as e:
-                            #                         print(e)
-                            #                     """)
-                            #     self.conn.execute(command)
-                            self.conn.execute(
-                                "stop = rp.activate_ssh(HOSTNAME, USER, PORT, PASSWORD, remote_port)"
-                            )
-                            # self.conn.execute("stop = rp.activate_ssh(\"" + str(HOSTNAME) + \
-                            #                   "\", \"" + str(USER) + \
-                            #                   "\", " + str(PORT) + \
-                            #                   ", \"" + str(PASSWORD) +\
-                            #                   "\", " + str(remote_port) + ")")
-                            print("Here 7")
-                            func_name = "stop"
-                        self.conn.execute(
-                            "runner_list.append(rp.NetworkRunner("
-                            + str(i)
-                            + ", "
-                            + '"'
-                            + str(j)
-                            + '"'
-                            + ", "
-                            + str(k)
-                            + ", "
-                            + func_name
-                            + "))"
-                        )
-                        runner = self.conn.namespace["runner_list"][-1]
-                    else:
-                        if callable(l):
-                            runner = NetworkRunner(i, j, k, l)
-                        else:
-                            runner = NetworkRunner(i, j, k, None)
-                case proxyprocess(i, j, k, l, m, n):
-                    if host is not None:
-                        self.conn.execute(
-                            "runner_list.append(rp.ProxyRunner("
-                            + str(i)
-                            + ", "
-                            + str(j)
-                            + ", "
-                            + str(k)
-                            + ", "
-                            + str(l)
-                            + ", "
-                            + str(m)
-                            + ", "
-                            + str(n)
-                            + "))"
-                        )
-                        runner = self.conn.namespace["runner_list"][-1]
-                    else:
-                        raise NotImplementedError("This causes an infinite loop")
-                case _:
-                    raise TypeError
-            self.process_num += runner.process_num
-            self.weight.append(runner.process_num)
-            self.connection.append(runner)
-        print("done init")
+                    connection = remote.SSHConnection(
+                        connection.host, user=connection.user, port=connection.port,
+                        password=connection.password, key_filename=connection.key_filename,
+                        shell=connection.shell, timeout=connection.timeout,
+                    )
+                elif not (isinstance(connection, tuple) and len(connection) == 2):
+                    raise TypeError(
+                        "Gateway network workers require SSHConnection or an RPC (host, port) tuple"
+                    )
+                return remote.networkprocess(number, connection)
+            case proxyprocess(number, host, port, children, login, remotes):
+                return remote.proxyprocess(
+                    number, host, port,
+                    [cls._copy_spec(remote, child) for child in children], login, remotes,
+                )
+            case _:
+                raise TypeError("Invalid runner descriptor")
 
     def schedule(self):
-        rand = random.choices(self.connection, weights=self.weight, k=1)[0]
-        return rand
+        if not self.connection:
+            raise RuntimeError("No runner")
+        return random.choices(self.connection, weights=self.weight, k=1)[0]
 
     def run(self, func, /, *args, **kwargs):
-        runner: Runner = self.schedule()
-        if not runner:
-            raise RuntimeError("No runner")
-
-        # teleport function
-        if self.host is not None:
-            self.conn.teleport(func)
-            self.conn.namespace["args"] = args
-            self.conn.namespace["kwargs"] = kwargs
-
-            # self.conn.namespace["printdata"] = print
-            # print("=======================================")
-            # import sys
-            # self.conn.modules.sys.stdout = sys.stdout
-            # self.conn.execute("printdata(args)")
-            # self.conn.execute("print(kwargs)")
-            # num = [5]
-            # def addnum():
-            #     num[0] += 2
-            # print(num)
-            # self.conn.namespace["addnum"] = addnum
-            # self.conn.execute("addnum()")
-            # print(num)
-            # print("=======================================")
-
-            run_lst: list = self.conn.namespace["runner_list"]
-            runner_index = run_lst.index(runner)
-            self.conn.execute(
-                f"result = runner_list[{runner_index}].run(worker_func, *args, **kwargs)"
-            )
-
-            result = self.conn.namespace["result"]
-            # print(self.conn.eval("type(result)"))
-            # print(self.conn.eval("dir(result)"))
-            # self.process_handle.append(RPC_Future(result, self))
-            self.process_handle.append(result)
-            future_instance = self.process_handle[-1]
+        if self._remote_proxy is not None:
+            # Use the supplied function; the old path hard-coded worker_func.
+            if self.conn is None:
+                raise RuntimeError("Gateway RPC connection is closed")
+            remote_func = self.conn.teleport(func)
+            result = self._remote_proxy.run(remote_func, *args, **kwargs)
         else:
-            future_instance = runner.run(func, *args, **kwargs)
-
-        return future_instance
+            result = self.schedule().run(func, *args, **kwargs)
+        self.process_handle.append(result)
+        return result
 
     def close(self):
-        for i in self.connection:
-            i.close()
+        errors = []
+        resources = [*self.connection, self._remote_proxy, self._gateway]
         self.connection.clear()
-        for i in self.drop_list:
-            i()
-        if self.stop:
-            self.stop()
+        self.weight.clear()
+        self.process_handle.clear()
+        self._remote_proxy = None
+        self._gateway = None
+        self.conn = None
+        for resource in resources:
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception as exc:
+                    errors.append(exc)
+        if errors:
+            raise errors[0]
 
     def status(self) -> tuple[bool, int, int, int]:
-        for i, v in enumerate(self.process_handle):
-            if self.process_handle[i].status():
-                self.process_handle.remove(v)
-
-        is_pool_active: bool = not not self.connection
-        process_num: int = self.process_num
-        not_done_count: int = len(self.process_handle)
-
-        # Connnection, max capacity, used capacity, latency
-        return (is_pool_active, process_num, not_done_count, 0)
+        self.process_handle = [f for f in self.process_handle if not f.status()]
+        active = self._remote_proxy is not None or bool(self.connection)
+        return active, self.process_num, len(self.process_handle), 0
 
 
 #################################################################
@@ -949,6 +885,11 @@ class DeployedCrossPlatformServer(DeployedServer):
 
     def close(self, timeout: int | None = 10):
         if self.proc is not None:
+            try:
+                self.proc.stdin.write(b"__recursiverpc_shutdown__\n")
+                self.proc.stdin.flush()
+            except (OSError, ValueError):
+                pass
             try:
                 self.proc.terminate()
                 self.proc.communicate(timeout=timeout)
