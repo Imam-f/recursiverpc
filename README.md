@@ -22,7 +22,7 @@ dependency
 ## Worker dependencies
 
 `Recursive_RPC(..., dependency=...)` creates isolated temporary uv projects for
-local workers, SSH workers, and proxy gateways/children. Packages are installed
+local workers, SSH workers, and proxy gateways/children. Packages are prepared
 before work starts. The caller's environment is unchanged, and temporary projects
 are removed when the pool closes. Keep the pool in a `with` block for cleanup.
 
@@ -71,10 +71,32 @@ Python version. Dependency-resolution or installation errors stop pool creation.
 The recursiverpc framework is bundled into each explicit dependency project as a
 wheel, so SSH workers do not need the framework checkout at the caller's path.
 The initial caller currently needs the source checkout to build that wheel.
-Omitting `dependency` retains the existing behavior; `dependency=[]` requests an
-isolated project containing only recursiverpc and its runtime dependencies.
+Omitting `dependency` retains the caller-environment dependency selection;
+`dependency=[]` requests an isolated project containing only recursiverpc and its
+runtime dependencies.
 Existing RPC `(host, port)` connections cannot be reconfigured with dependencies;
 use a managed `SSHConnection` worker to create a new environment.
+
+### Copying compatible environments
+
+Managed SSH workers compare OS and CPU architecture before installing packages.
+On matching systems, they prefer copying the venv. Python implementation, major/
+minor version, ABI, word size, Python constraints, and Linux libc compatibility
+are also checked. An already installed compatible interpreter is required for
+the copy path; it never downloads Python.
+
+With `dependency=...`, an environment is prepared locally once for copying, and
+its archive is reused for SSH workers and proxy children. Packages may need to be
+downloaded on the controller during that first preparation, but the destination
+does not run `uv sync` or download packages when copying succeeds. Without an
+explicit dependency, the current venv is copied, including a bundled framework
+wheel if recursiverpc is installed as editable source.
+
+The destination venv is rebased onto its local interpreter, activation files and
+console launchers are relocated, and installed versions, wheel compatibility,
+and framework imports are validated before startup. OS/architecture mismatches,
+missing compatible interpreters, external editable paths, or failed validation
+fall back to the usual uv installation. A failed partial copy is removed first.
 
 ## SSH login shells
 
@@ -110,8 +132,8 @@ The server's host key is checked against `known_hosts`. Existing `SshMachine` an
 `ParamikoMachine` connections remain accepted; their own initialization may
 require Bash. Git Bash and Linux Bash both use the `bash` override.
 
-Shell support does not copy your project or its local dependencies to another
-computer. The existing editable dependency paths must be accessible remotely.
+Arbitrary application source trees are not copied. External editable dependency
+paths must be accessible remotely if setup falls back to installation.
 Windows command arguments are forwarded through Python's subprocess API to
 preserve quotes and shell-sensitive characters without another shell parse.
 

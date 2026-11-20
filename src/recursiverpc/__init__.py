@@ -2,6 +2,7 @@ from .recursiverpc import tupleprocess, localprocess, networkprocess, proxyproce
 from .recursiverpc import Recursive_RPC, RPC_Future
 from .recursiverpc import ProcessRunner, NetworkRunner, ProxyRunner, Pool
 from .ssh import SSHConnection, ShellAwareMachine, shell_aware
+from .setup import SetupScript
 # from .recursive_rpc import RemoteUVRunner, activate_ssh
 # import rpyc_classic
 

@@ -27,6 +27,8 @@ from plumbum.commands.base import BoundCommand
 from plumbum.machines.paramiko_machine import ParamikoMachine
 from .ssh import SSHConnection, RemoteShell, shell_aware
 from .dependencies import DependencyInput, DependencySpec, LocalProject, parse_dependency
+from .venv import current_environment_bundle, try_copy_environment
+from .setup import SetupScript
 
 old_print = print
 
@@ -50,7 +52,7 @@ if __name__ == "__main__":
     import time
     
     here = os.path.dirname(__file__)
-    os.chdir(here)
+    os.chdir(os.environ.get("RECURSIVERPC_WORKDIR", here))
 
     def rmdir():
         shutil.rmtree(here, ignore_errors = True)
@@ -167,8 +169,19 @@ class Recursive_RPC:
         client: list[localprocess | networkprocess | proxyprocess],
         conn: Dict[str, Tuple] | None = None,
         dependency: DependencyInput | DependencySpec | None = None,
+        *,
+        copy_local_dependencies: bool = False,
+        copy_project: bool | str | os.PathLike[str] = False,
+        setup_script: SetupScript | str | os.PathLike[str] | None = None,
     ):
-        self.dependency = parse_dependency(dependency).prepared() if dependency is not None else None
+        if dependency is None and (copy_local_dependencies or copy_project or setup_script is not None):
+            project = Path.cwd() / 'pyproject.toml'
+            dependency = project if project.is_file() else []
+        parsed = parse_dependency(dependency) if dependency is not None else None
+        if parsed is not None and (copy_local_dependencies or copy_project or setup_script is not None):
+            parsed = parsed.configured(copy_local_dependencies=copy_local_dependencies,
+                                       copy_project=copy_project, setup_script=setup_script)
+        self.dependency = parsed.prepared() if parsed is not None else None
         self.client: list[localprocess | networkprocess | proxyprocess] = client
         self.connection: list[None | Runner] = [None for i in range(len(client))]
         self.weight: list[int] = [0 for i in range(len(self.connection))]
@@ -443,6 +456,7 @@ class NetworkRunner(Runner):
                         extra_setup=extra_setup,
                         server_class="rpyc.utils.server.OneShotServer",
                         python_executable=executable,
+                        copy_venv=True,
                     )
 
                 self.conn = self.server.classic_connect()
@@ -865,11 +879,13 @@ class DeployedCrossPlatformServer(DeployedServer):
         extra_setup="",
         python_executable=None,
         dependency: DependencySpec | None = None,
+        copy_venv: bool = False,
     ) -> None:
         self.proc = None
         self.tun = None
         self.remote_machine = remote_machine
         self._tmpdir_ctx = None
+        self.environment_setup = None
         remote_machine = shell_aware(remote_machine)
         self.remote_machine = remote_machine
 
@@ -877,14 +893,29 @@ class DeployedCrossPlatformServer(DeployedServer):
         tmp = self._tmpdir_ctx.__enter__()
         try:
             if dependency is not None:
-                dependency.install_remote(remote_machine, tmp)
-                environment = tmp.rstrip('/\\') + '/.venv'
-                cmd = remote_machine.command("uv").with_env(
-                    UV_PROJECT_ENVIRONMENT=environment, VIRTUAL_ENV=None,
-                )["run", "--project", tmp, "--no-sync", "--no-dev", "python", "-u"]
+                copied = dependency.install_remote(remote_machine, tmp)
+                if copied is not None:
+                    self.environment_setup = 'copied'
+                    environment = tmp.rstrip('/\\') + '/.venv'
+                    cmd = remote_machine.command(copied).with_env(VIRTUAL_ENV=environment)['-u']
+                else:
+                    self.environment_setup = 'installed'
+                    environment = tmp.rstrip('/\\') + '/.venv'
+                    cmd = remote_machine.command("uv").with_env(
+                        UV_PROJECT_ENVIRONMENT=environment, VIRTUAL_ENV=None,
+                    )["run", "--project", tmp, "--no-sync", "--no-dev", "python", "-u"]
+                if dependency.workdir is not None:
+                    workdir = tmp.rstrip('/\\') + '/' + dependency.workdir
+                    cmd = cmd.with_env(RECURSIVERPC_WORKDIR=workdir).with_cwd(workdir)
             else:
+                copied = try_copy_environment(remote_machine, tmp, current_environment_bundle) if copy_venv else None
+                self.environment_setup = 'installed' if copy_venv else None
                 # print(python_executable)
-                if isinstance(python_executable, (list, tuple)):
+                if copied is not None:
+                    self.environment_setup = 'copied'
+                    environment = tmp.rstrip('/\\') + '/.venv'
+                    cmd = remote_machine.command(copied).with_env(VIRTUAL_ENV=environment)['-u']
+                elif isinstance(python_executable, (list, tuple)):
                     cmd = remote_machine.command(python_executable[0])
                     for part in python_executable[1:]:
                         cmd = cmd[part]
