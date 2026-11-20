@@ -13,7 +13,7 @@ from pathlib import Path
 from uv import find_uv_bin
 
 from concurrent.futures import Future
-from threading import Thread, Event
+from threading import Thread, Event, RLock
 
 import rpyc
 from rpyc import BgServingThread
@@ -782,7 +782,7 @@ class Pool:
         self.scheduler = []
 
         # print("Connecting")
-        for _ in range(max_workers):
+        for _ in range(self.max_workers):
             conn = rpyc.classic.connect_multiprocess()
             conn.modules.sys.stdout = sys.stdout
             conn.modules.sys.stderr = sys.stderr
@@ -790,6 +790,8 @@ class Pool:
 
         self.scheduler_index = 0
         self.scheduler_status: list[bool] = [False] * self.max_workers
+        self._scheduler_lock = RLock()
+        self._pending_tasks = [0] * self.max_workers
 
     def __enter__(self):
         return self
@@ -798,37 +800,55 @@ class Pool:
         self.close()
 
     def _schedule(self):
-        index = self.scheduler_index
-        index_found = False
-        for i in range(len(self.scheduler_status)):
-            if not self.scheduler_status[(index + i) % len(self.scheduler_status)]:
-                index = (index + i) % len(self.scheduler_status)
-                self.scheduler_status[index] = True
-                index_found = True
-                break
-            else:
-                index = (index + i) % len(self.scheduler_status)
-        if not index_found:
-            index = (index + 1) % len(self.scheduler_status)
-            print("ALL BUSY")
-        self.scheduler_index = index
-        return self.scheduler[index]
+        with self._scheduler_lock:
+            start = self.scheduler_index
+            count = len(self.scheduler_status)
+            index = next(
+                ((start + offset) % count for offset in range(count)
+                 if not self.scheduler_status[(start + offset) % count]),
+                (start + 1) % count,
+            )
+            self.scheduler_index = index
+            self._pending_tasks[index] += 1
+            self.scheduler_status[index] = True
+            return self.scheduler[index]
+
+    def _release_worker(self, index):
+        with self._scheduler_lock:
+            self._pending_tasks[index] -= 1
+            self.scheduler_status[index] = self._pending_tasks[index] > 0
 
     def apply_async(self, func, args, kwargs):
-        runner = self._schedule()
-        function = runner.teleport(func)
-
+        with self._scheduler_lock:
+            runner = self._schedule()
+            scheduler_index = self.scheduler_index
         result_future = Future()
 
-        def function_async(*args, **kwargs):
-            nonlocal result_future
-            result = function(*args, **kwargs)
-            result_future.set_running_or_notify_cancel()
-            result_future.set_result(result)
-            self.scheduler_status[self.scheduler_index] = False
+        try:
+            function = runner.teleport(func)
+        except BaseException:
+            self._release_worker(scheduler_index)
+            raise
 
-        thread = Thread(target=function_async, args=args, kwargs=kwargs)
-        thread.start()
+        def function_async(*args, **kwargs):
+            try:
+                if not result_future.set_running_or_notify_cancel():
+                    return
+                try:
+                    result = function(*args, **kwargs)
+                except BaseException as exc:
+                    result_future.set_exception(exc)
+                else:
+                    result_future.set_result(result)
+            finally:
+                self._release_worker(scheduler_index)
+
+        try:
+            thread = Thread(target=function_async, args=args, kwargs=kwargs)
+            thread.start()
+        except BaseException:
+            self._release_worker(scheduler_index)
+            raise
 
         return result_future
 

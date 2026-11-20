@@ -79,7 +79,7 @@ def main():
                 #     networkprocess(2, HOSTNAME, remote_port[2], "tag1")
                 # ], ssh_login, {"tag1": (HOSTNAME, USER, PORT, PASSWORD, remote_port[2])}),
                 localprocess(4),
-                networkprocess(4, sshmachine),
+                # networkprocess(4, sshmachine),
                 # networkprocess(2, HOSTNAME, remote_port[0], stop),
                 # networkprocess(2, HOSTNAME, remote_port[3], stop2)
             ],
