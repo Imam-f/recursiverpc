@@ -16,7 +16,7 @@ import tomlkit
 from recursiverpc import Recursive_RPC, localprocess
 from recursiverpc.dependencies import DependencySpec, LocalProject, parse_dependency
 
-rpc = importlib.import_module('recursiverpc.recursiverpc')
+rpc = importlib.import_module('recursiverpc.runners')
 
 
 def worker_probe():

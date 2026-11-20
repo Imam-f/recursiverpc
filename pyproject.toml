@@ -1,7 +1,7 @@
 [project]
 name = "recursiverpc"
 version = "0.1.0"
-description = "Add your description here"
+description = "Run Python functions across local processes and recursive SSH worker pools with RPyC."
 readme = "README.md"
 authors = [
     { name = "Imam-f", email = "mohamadimamfirdaus17@gmail.com" }

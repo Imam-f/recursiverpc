@@ -9,7 +9,7 @@ from recursiverpc.ssh import RemoteShell, ShellAwareMachine, shell_aware, shell_
 from plumbum.machines.paramiko_machine import ParamikoMachine, ParamikoPopen
 from plumbum.machines.ssh_machine import SshMachine
 from recursiverpc.ssh import SSHProcess
-rpc = importlib.import_module("recursiverpc.recursiverpc")
+rpc = importlib.import_module("recursiverpc.runners")
 
 class RemoteCommandTests(unittest.TestCase):
     def remote(self, shell, path):

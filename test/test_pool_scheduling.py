@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-rpc = importlib.import_module("recursiverpc.recursiverpc")
+rpc = importlib.import_module("recursiverpc.pool")
 
 
 class PoolSchedulingTests(unittest.TestCase):

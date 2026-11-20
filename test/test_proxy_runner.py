@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from recursiverpc import SSHConnection, localprocess, networkprocess, proxyprocess
 
-rpc = importlib.import_module('recursiverpc.recursiverpc')
+rpc = importlib.import_module('recursiverpc.runners')
 
 
 def complete(value):

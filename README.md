@@ -237,3 +237,40 @@ Run the isolated regression tests (without SSH credentials):
 On Windows, the Linux Bash tests use the `Ubuntu-22.04` WSL distribution. The
 tests launch a small bootstrap, verify script bytes and shell detection, and
 check startup and cleanup; they do not run the distributed workload.
+
+### Development and diagnostics
+
+The supported Python range is currently 3.10.16 through 3.10.x
+(`requires-python = "~=3.10.16"`). Broader Python support needs separate validation.
+
+The implementation is divided by responsibility:
+
+- `config.py`: worker descriptors.
+- `scheduler.py` and `futures.py`: the public scheduler and result handles.
+- `pool.py` and `runners.py`: process dispatch and local, SSH, and proxy runners.
+- `bootstrap.py` and `deployment.py`: server startup, output monitoring, and cleanup.
+- `ssh.py`: shell adaptation; `dependencies.py`, `venv.py`, `sources.py`, and
+  `setup.py`: worker environments and setup.
+
+Public imports such as `from recursiverpc import Recursive_RPC` remain supported.
+The original `recursiverpc.recursiverpc` module reexports its classes for existing
+imports and serialized worker descriptors.
+
+Library diagnostics use Python logging and are quiet by default. Task stdout and
+stderr continue to be forwarded. To see startup and cleanup details:
+
+```python
+import logging
+
+logging.basicConfig(level=logging.WARNING)
+logging.getLogger("recursiverpc").setLevel(logging.DEBUG)
+```
+
+Run the automated regression suite from the `test` directory:
+
+```powershell
+..\.venv\Scripts\python.exe -B -m unittest test_public_api test_pool_scheduling test_proxy_runner test_remote_command test_ssh_setup test_cross_shell test_server_lifecycle test_dependencies test_venv_copy test_local_sources -v
+```
+
+The other scripts in `test` are manual experiments and may require live servers
+or SSH credentials.
