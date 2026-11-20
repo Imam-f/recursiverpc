@@ -1,0 +1,215 @@
+"""SSH execution without assuming the server's login shell is POSIX."""
+
+from dataclasses import dataclass
+import json
+import re
+import shlex
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+
+import paramiko
+from plumbum.commands import CommandNotFound, ProcessExecutionError
+
+
+def shell_command(argv, shell):
+    """Quote individual native-process arguments for the selected login shell."""
+    argv = [str(arg) for arg in argv]
+    if shell == "bash":
+        return shlex.join(argv)
+    if shell == "powershell":
+        return "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in argv) + "; exit $LASTEXITCODE"
+    if shell == "cmd":
+        # Percent expansion occurs even inside double quotes. Our Python
+        # operations use hex payloads; reject unsafe arbitrary command arguments.
+        if any(any(c in arg for c in '%!\r\n') for arg in argv):
+            raise ValueError("cmd arguments cannot contain %, !, or newlines")
+        parts = [subprocess.list2cmdline([arg]) for arg in argv]
+        return " ".join(part if part.startswith('"') else '"' + part + '"' for part in parts)
+    raise ValueError(f"Unsupported SSH shell: {shell}")
+
+
+@dataclass
+class SSHConnection:
+    """SSH configuration for any supported login shell (including native Windows).
+
+    Host keys must be in known_hosts, unless a different policy is supplied.
+    """
+
+    host: str
+    user: str | None = None
+    port: int = 22
+    password: str | None = None
+    key_filename: str | None = None
+    shell: str = "auto"
+    timeout: float = 15
+    missing_host_policy: object = None
+
+    def connect(self):
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        if self.missing_host_policy is not None:
+            client.set_missing_host_key_policy(self.missing_host_policy)
+        try:
+            client.connect(self.host, port=self.port, username=self.user,
+                           password=self.password, key_filename=self.key_filename,
+                           timeout=self.timeout, auth_timeout=self.timeout,
+                           banner_timeout=self.timeout)
+            return RemoteShell(client, shell=self.shell, timeout=self.timeout)
+        except BaseException:
+            client.close()
+            raise
+
+
+class SSHProcess:
+    def __init__(self, client, command):
+        self.argv = [command]
+        self.stdin, self.stdout, self.stderr = client.exec_command(command)
+        self.channel = self.stdout.channel
+        self.returncode = None
+
+    def poll(self):
+        if self.channel.exit_status_ready():
+            self.returncode = self.channel.recv_exit_status()
+        return self.returncode
+
+    def terminate(self):
+        # The bootstrap server waits on stdin. EOF requests graceful shutdown.
+        if self.channel.closed or self.channel.exit_status_ready():
+            return
+        self.stdin.flush()
+        self.channel.shutdown_write()
+
+    def kill(self):
+        self.channel.close()
+
+    def communicate(self, input=None, timeout=None):
+        if input is not None:
+            self.stdin.write(input)
+        self.terminate()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            stdout = executor.submit(self.stdout.read)
+            stderr = executor.submit(self.stderr.read)
+            try:
+                result = stdout.result(timeout), stderr.result(timeout)
+            except TimeoutError:
+                self.kill()
+                raise subprocess.TimeoutExpired(self.argv, timeout)
+        self.returncode = self.channel.recv_exit_status()
+        self.channel.close()
+        return result
+
+
+class RemoteCommand:
+    def __init__(self, remote, argv):
+        self.remote = remote
+        self.argv = list(argv)
+
+    def __getitem__(self, args):
+        if not isinstance(args, tuple):
+            args = (args,)
+        return RemoteCommand(self.remote, self.argv + list(args))
+
+    def popen(self, *args, **kwargs):
+        return self.remote.popen(shell_command(self.argv + list(args), self.remote.shell))
+
+    def __call__(self, *args):
+        code, stdout, stderr = self.remote.run(shell_command(self.argv + list(args), self.remote.shell))
+        if code:
+            raise ProcessExecutionError(self.argv, code, stdout, stderr)
+        return stdout
+
+
+class RemoteShell:
+    """Wrap Paramiko clients or existing Plumbum SSH machines using raw exec."""
+
+    def __init__(self, machine, shell="auto", timeout=15):
+        self.machine = machine
+        self.timeout = timeout
+        self.client = machine if isinstance(machine, paramiko.SSHClient) else getattr(machine, "_client", None)
+        self.shell = shell
+        if shell == "auto":
+            probes = [
+                ("powershell", "[Console]::Write('__rrpc_powershell__')", "__rrpc_powershell__"),
+                ("bash", 'if [ -n "$BASH_VERSION" ]; then printf __rrpc_bash__; fi', "__rrpc_bash__"),
+                ("cmd", "echo %COMSPEC%", None),
+            ]
+            for candidate, command, marker in probes:
+                code, output, _ = self.run(command)
+                if code == 0 and ((marker and output.strip() == marker) or
+                                  (candidate == "cmd" and output.strip().lower().endswith("cmd.exe"))):
+                    self.shell = candidate
+                    break
+            else:
+                raise RuntimeError("Could not detect SSH shell; specify bash, powershell, or cmd")
+        if self.shell not in ("bash", "powershell", "cmd"):
+            raise ValueError(f"Unsupported SSH shell: {self.shell}")
+        self.python = None
+        for argv in (["python3"], ["python"], ["py", "-3"],
+                     ["uv", "run", "--no-project", "python"]):
+            probe = "import sys;print(731029*(sys.version_info>=(3,10)))"
+            code, output, _ = self.run(shell_command(argv + ["-c", probe], self.shell))
+            if code == 0 and output.strip() == "731029":
+                self.python = argv
+                break
+        if self.python is None:
+            raise RuntimeError("Remote Python 3.10+ is required (python3, python, py -3, or uv)")
+
+    def popen(self, command):
+        if self.client is not None:
+            return SSHProcess(self.client, command)
+        # Bypass Plumbum's POSIX cd/env prefix and argument quoting.
+        return self.machine._ssh_command[self.machine._fqhost, command].popen()
+
+    def run(self, command, input=None):
+        proc = self.popen(command)
+        stdout, stderr = proc.communicate(input=input, timeout=self.timeout)
+        def text(value):
+            return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+        return proc.returncode, text(stdout), text(stderr)
+
+    def python_run(self, script, input=None):
+        # No user text, paths, or script contents are interpolated into shell syntax.
+        encoded = script.encode("utf-8").hex()
+        expression = "exec(bytes.fromhex('" + encoded + "').decode('utf-8'))"
+        command = shell_command(self.python + ["-c", expression], self.shell)
+        code, stdout, stderr = self.run(command, input=input)
+        if code:
+            raise ProcessExecutionError(self.python, code, stdout, stderr)
+        return stdout.strip()
+
+    def command(self, executable):
+        path = json.loads(self.python_run(
+            "import json,shutil; print(json.dumps(shutil.which(" + repr(executable) + ")))"
+        ))
+        if path is None:
+            raise CommandNotFound(executable, [])
+        if self.shell == "bash" and re.match(r"^[A-Za-z]:", path):
+            path = path.replace("\\", "/")
+        return RemoteCommand(self, [path])
+
+    def make_temp_dir(self):
+        return json.loads(self.python_run(
+            "import json,tempfile; print(json.dumps(tempfile.mkdtemp(prefix='recursiverpc-')))"
+        ))
+
+    def write_script(self, directory, content):
+        return json.loads(self.python_run(
+            "import json,pathlib,sys; p=pathlib.Path(" + repr(directory) + ")/'server.py'; "
+            "p.write_bytes(sys.stdin.buffer.read()); print(json.dumps(str(p)))",
+            input=content.encode("utf-8"),
+        ))
+
+    def remove_temp_dir(self, directory):
+        self.python_run(
+            "import pathlib,shutil; p=pathlib.Path(" + repr(directory) + ").resolve(); "
+            "assert p.name.startswith('recursiverpc-'), 'Unexpected temporary path'; "
+            "shutil.rmtree(p) if p.exists() else None"
+        )
+
+    def connect_sock(self, port):
+        return self.client.get_transport().open_channel(
+            "direct-tcpip", ("localhost", port), ("localhost", 0)
+        )
+
+    def close(self):
+        self.machine.close()

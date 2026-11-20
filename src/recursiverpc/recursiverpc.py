@@ -23,6 +23,7 @@ from plumbum import SshMachine
 from plumbum.commands import CommandNotFound, ProcessExecutionError
 from plumbum.commands.base import BoundCommand
 from plumbum.machines.paramiko_machine import ParamikoMachine
+from .ssh import SSHConnection, RemoteShell
 
 old_print = print
 
@@ -94,7 +95,7 @@ class localprocess(tupleprocess):
 @dataclass
 class networkprocess(tupleprocess):
     number: int
-    connection: SshMachine | ParamikoMachine | tuple[str, int]
+    connection: SshMachine | ParamikoMachine | SSHConnection | tuple[str, int]
 
 
 @dataclass
@@ -318,12 +319,16 @@ class ProcessRunner(Runner):
 
 
 class NetworkRunner(Runner):
-    def __init__(self, num: int, con: SshMachine | ParamikoMachine | tuple[str, int]):
+    def __init__(self, num: int, con: SshMachine | ParamikoMachine | SSHConnection | RemoteShell | tuple[str, int]):
         self.process_num = num
 
         self.server = None
+        self.conn = None
+        self.machine = None
+        if isinstance(con, SSHConnection):
+            con = con.connect()
         match con:
-            case SshMachine() | ParamikoMachine():
+            case SshMachine() | ParamikoMachine() | RemoteShell():
                 self.machine = con
 
                 # Get uv binary path
@@ -866,7 +871,7 @@ class Pool:
 class DeployedCrossPlatformServer(DeployedServer):
     def __init__(
         self,
-        remote_machine: SshMachine | ParamikoMachine,
+        remote_machine: SshMachine | ParamikoMachine | RemoteShell,
         server_class="rpyc.utils.server.ThreadedServer",
         service_class="rpyc.core.service.SlaveService",
         server_script=SERVER_SCRIPT,
@@ -877,86 +882,89 @@ class DeployedCrossPlatformServer(DeployedServer):
         self.tun = None
         self.remote_machine = remote_machine
         self._tmpdir_ctx = None
+        remote_machine = (remote_machine if isinstance(remote_machine, RemoteShell)
+                          else RemoteShell(remote_machine))
+        self.remote_machine = remote_machine
 
         # print(python_executable)
         if isinstance(python_executable, (list, tuple)):
-            cmd = remote_machine[python_executable[0]]
+            cmd = remote_machine.command(python_executable[0])
             for part in python_executable[1:]:
                 cmd = cmd[part]
         elif isinstance(python_executable, BoundCommand):
-            cmd = python_executable
+            arguments = []
+            while isinstance(python_executable, BoundCommand):
+                arguments = list(python_executable.args) + arguments
+                python_executable = python_executable.cmd
+            cmd = remote_machine.command(str(python_executable.executable))[tuple(arguments)]
         elif python_executable:
-            cmd = remote_machine[python_executable]
+            cmd = remote_machine.command(python_executable)
         else:
-            cmd = remote_machine[
-                    "uv",
-                    "run",
-                    "-q",
-                    "--",
-                    "python",
-                ]
+            cmd = remote_machine.command("uv")[
+                "run", "-q", "--", "python"
+            ]
 
         self._tmpdir_ctx = CrossPlatformTempDir(remote_machine)
         tmp = self._tmpdir_ctx.__enter__()
 
-        server_modname, server_clsname = server_class.rsplit(".", 1)
-        service_modname, service_clsname = service_class.rsplit(".", 1)
+        try:
+            server_modname, server_clsname = server_class.rsplit(".", 1)
+            service_modname, service_clsname = service_class.rsplit(".", 1)
 
-        for source, target in (
-            ("$SERVER_MODULE$", server_modname),
-            ("$SERVER_CLASS$", server_clsname),
-            ("$SERVICE_MODULE$", service_modname),
-            ("$SERVICE_CLASS$", service_clsname),
-            ("$EXTRA_SETUP$", extra_setup),
-        ):
-            server_script = server_script.replace(source, target)
+            for source, target in (
+                ("$SERVER_MODULE$", server_modname),
+                ("$SERVER_CLASS$", server_clsname),
+                ("$SERVICE_MODULE$", service_modname),
+                ("$SERVICE_CLASS$", service_clsname),
+                ("$EXTRA_SETUP$", extra_setup),
+            ):
+                server_script = server_script.replace(source, target)
 
-        # Write server script
-        script_path = self._write_server_script(remote_machine, tmp, server_script)
-        print("\n\n\n-------------")
-        print(script_path, cmd.bound_command)
+            # Write server script
+            script_path = self._write_server_script(remote_machine, tmp, server_script)
 
-        self.proc = cmd.popen(script_path, new_session=True)
-        self._handle_server_startup()
+            self.proc = cmd.popen(script_path, new_session=True)
+            self._handle_server_startup()
 
-        # if hasattr(remote_machine, "connect_sock"):
-        if isinstance(remote_machine, ParamikoMachine):
-            self.local_port = None
-        else:
-            import socket
-            from contextlib import closing
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            with closing(s):
-                s.bind(("localhost", 0))
-                self.local_port = s.getsockname()[1]
-            self.tun = remote_machine.tunnel(self.local_port, self.remote_port)
+            # if hasattr(remote_machine, "connect_sock"):
+            if remote_machine.client is not None:
+                self.local_port = None
+            else:
+                import socket
+                from contextlib import closing
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                with closing(s):
+                    s.bind(("localhost", 0))
+                    self.local_port = s.getsockname()[1]
+                self.tun = remote_machine.machine.tunnel(self.local_port, self.remote_port)
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     def _write_server_script(self, remote_machine, tmp_dir, server_script):
-        """Write server script in a cross-platform way"""
-        # TODO: Remove all instance of manual session
-        s = remote_machine.session()
-        try:
-            print(tmp_dir)
-            s.run(f"cd '{tmp_dir}'")
+        remote = (remote_machine if isinstance(remote_machine, RemoteShell)
+                  else RemoteShell(remote_machine))
+        return remote.write_script(tmp_dir, server_script)
 
-            # Write script line by line to avoid shell escaping issues
-            s.run("rm -f server.py")  # Remove if exists
-            for line in server_script.split("\n"):
-                # Escape single quotes in the line
-                escaped_line = line.replace("'", "'\"'\"'")
-                s.run(f"echo '{escaped_line}' >> server.py")
-
-            # Get absolute path
-            result = s.run("pwd")
-            current_dir = result[1].strip()
-            script_path = f"{current_dir}/server.py"
-            print(s.run(f"cat '{script_path}'"))
-            # print(s.run(f"env | grep path"))
-            # print(s.run(f"uv"))
-
-            return script_path
-        finally:
-            del s
+    def close(self, timeout=10):
+        if self.proc is not None:
+            try:
+                self.proc.terminate()
+                self.proc.communicate(timeout=timeout)
+            except Exception:
+                self.proc.kill()
+            finally:
+                self.proc = None
+        if self.tun is not None:
+            self.tun.close()
+            self.tun = None
+        # Cleanup must happen while the SSH connection is still open.
+        if self._tmpdir_ctx is not None:
+            self._tmpdir_ctx.__exit__(None, None, None)
+            self._tmpdir_ctx = None
 
     def _handle_server_startup(self):
         """Handle server startup and output monitoring"""
@@ -978,7 +986,9 @@ class DeployedCrossPlatformServer(DeployedServer):
                         if self.proc is None:
                             raise Exception("stdout is None")
                         line = self.proc.stdout.read(1)
-                        if line != b"":
+                        if line in (b"", ""):
+                            break
+                        else:
                             print(">", line, "<", sep="", end="")
                     except Exception as e:
                         print(e)
@@ -1007,65 +1017,27 @@ class DeployedCrossPlatformServer(DeployedServer):
 
 
 class CrossPlatformTempDir:
-    """Cross-platform temporary directory context manager"""
+    """Create and clean an owned directory using remote Python on any shell."""
 
     def __init__(self, remote_machine):
         self.remote_machine = remote_machine
         self.path = None
-        self.session = None
 
     def __enter__(self):
-        # TODO: remove all instance of manual session
-        self.session = self.remote_machine.session()
-
-        # Try Unix/Linux/macOS method first
-        result = self.session.run("mktemp -d")
-
-        if result[0] == 0:
-            self.path = result[1].strip()
-            return self.path
-
-        # Try Python method (more portable)
-        result = self.session.run(
-            "python3 -c 'import tempfile; print(tempfile.mkdtemp())'"
-        )
-
-        if result[0] == 0:
-            self.path = result[1].strip()
-            return self.path
-
-        # Fallback method
-        import uuid
-
-        temp_name = f"tmp_{uuid.uuid4().hex[:8]}"
-
-        # Try different temp locations
-        temp_bases = ["/tmp", "~/tmp", "."]
-        for base in temp_bases:
-            result = self.session.run(f"mkdir -p {base}/{temp_name}")
-            if result[0] == 0:
-                pwd_result = self.session.run(f"cd {base}/{temp_name} && pwd")
-                if pwd_result[0] == 0:
-                    self.path = pwd_result[1].strip()
-                    return self.path
-
-        raise RuntimeError("Could not create temporary directory")
+        if not isinstance(self.remote_machine, RemoteShell):
+            self.remote_machine = RemoteShell(self.remote_machine)
+        self.path = self.remote_machine.make_temp_dir()
+        return self.path
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not (self.path and self.session):
+        if self.path is None:
             return
-
-        # Clean up temporary directory
-        max_retries = 3
-        for attempt in range(max_retries):
-            # TODO: remove all instance of manual session
-            result = self.session.run(f"rm -rf '{self.path}'")
-            if result[0] == 0:
-                break
-
-            if attempt < max_retries - 1:
-                time.sleep(1)  # Wait before retry
-            else:
-                print(f"Warning: Could not clean up temp directory {self.path}")
-
-        del self.session
+        for attempt in range(3):
+            try:
+                self.remote_machine.remove_temp_dir(self.path)
+                self.path = None
+                return
+            except (ProcessExecutionError, OSError):
+                if attempt == 2:
+                    raise
+                time.sleep(1)
