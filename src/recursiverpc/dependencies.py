@@ -297,7 +297,8 @@ class LocalProject:
             if dependency.setup is not None and run_setup:
                 script = self.path / 'setup_driver.py'
                 script.write_text(setup_code(dependency.setup, str(self.path), dependency.workdir), encoding='utf-8')
-                result = subprocess.run([str(executable), '-I', str(script)], capture_output=True, text=True)
+                result = subprocess.run([str(executable), '-I', str(script)], capture_output=True,
+                                        text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL)
                 if result.returncode:
                     raise RuntimeError(f'Worker setup script failed:\n{result.stdout}\n{result.stderr}')
         except BaseException:

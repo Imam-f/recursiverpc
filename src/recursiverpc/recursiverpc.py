@@ -175,7 +175,8 @@ class Recursive_RPC:
         setup_script: SetupScript | str | os.PathLike[str] | None = None,
     ):
         if dependency is None and (copy_local_dependencies or copy_project or setup_script is not None):
-            project = Path.cwd() / 'pyproject.toml'
+            source = Path(copy_project) if not isinstance(copy_project, bool) else Path.cwd()
+            project = source / 'pyproject.toml'
             dependency = project if project.is_file() else []
         parsed = parse_dependency(dependency) if dependency is not None else None
         if parsed is not None and (copy_local_dependencies or copy_project or setup_script is not None):

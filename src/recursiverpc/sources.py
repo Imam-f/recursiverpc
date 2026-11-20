@@ -24,11 +24,36 @@ def _file_url(value: str) -> Path | None:
     return Path(url2pathname(('//' + url.netloc if url.netloc not in ('', 'localhost') else '') + url.path))
 
 
+def _workspace_source(origin: Path, name: str) -> Path:
+    for root in (origin, *origin.parents):
+        project = root / 'pyproject.toml'
+        if not project.is_file():
+            continue
+        data = tomlkit.parse(project.read_text(encoding='utf-8')).unwrap()
+        workspace = data.get('tool', {}).get('uv', {}).get('workspace')
+        if not workspace:
+            continue
+        matches = []
+        for pattern in workspace.get('members', []):
+            for directory in root.glob(pattern):
+                if any(directory.relative_to(root).match(excluded) for excluded in workspace.get('exclude', [])):
+                    continue
+                config = directory / 'pyproject.toml'
+                if config.is_file():
+                    child = tomlkit.parse(config.read_text(encoding='utf-8')).unwrap()
+                    if canonicalize_name(child.get('project', {}).get('name', '')) == canonicalize_name(name):
+                        matches.append(directory)
+        if len(matches) == 1:
+            return matches[0]
+    raise ValueError(f'Cannot resolve uv workspace dependency {name!r}')
+
+
 class SourceBundle:
-    def __init__(self):
+    def __init__(self, follow_dependencies: bool = True):
         self.destinations: dict[Path, str] = {}
         self.files: dict[str, tuple[bytes, int]] = {}
         self.sources: dict[str, dict] = {}
+        self.follow_dependencies = follow_dependencies
 
     def add(self, source: Path, name: str) -> str:
         source = source.resolve()
@@ -51,7 +76,7 @@ class SourceBundle:
             candidates = list(source.rglob('*'))
         for path in candidates:
             relative = path.relative_to(source)
-            if (any(part in ('.git', '.venv', 'venv', '__pycache__') for part in relative.parts)
+            if (any(part in ('.git', '.venv', 'venv', '__pycache__') or part.endswith('.egg-info') for part in relative.parts)
                     or relative.parts[0] in ('dist', 'build')
                     or path.name.startswith('.env') or path.suffix in ('.pyc', '.pyo')):
                 continue
@@ -60,7 +85,7 @@ class SourceBundle:
             if path.is_file():
                 self.files[target + '/' + relative.as_posix()] = path.read_bytes(), path.stat().st_mode
         project = source / 'pyproject.toml'
-        if project.is_file():
+        if project.is_file() and self.follow_dependencies:
             data = tomlkit.parse(project.read_text(encoding='utf-8')).unwrap()
             self.rewrite(data, source, target)
             self.files[target + '/pyproject.toml'] = tomlkit.dumps(data).encode('utf-8'), 0o644
@@ -90,7 +115,12 @@ class SourceBundle:
         for name, configuration in list(sources.items()):
             entries = configuration if isinstance(configuration, list) else [configuration]
             for entry in entries:
-                if not isinstance(entry, dict) or 'path' not in entry:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get('workspace'):
+                    entry['path'] = str(_workspace_source(origin, name))
+                    entry.pop('workspace')
+                if 'path' not in entry:
                     continue
                 path = Path(entry['path'])
                 if not path.is_absolute():
@@ -115,16 +145,20 @@ def bundle_sources(project: str, origin: str | None, copy_dependencies: bool,
                    copy_project: bool | str | os.PathLike[str]) -> tuple[str, bytes, str | None]:
     data = tomlkit.parse(project).unwrap()
     root = Path(origin) if origin else Path.cwd()
-    bundle = SourceBundle()
+    bundle = SourceBundle(follow_dependencies=copy_dependencies)
     if copy_dependencies:
         bundle.rewrite(data, root)
     workdir = None
     if copy_project:
         path = root if copy_project is True else Path(copy_project).resolve()
+        if not path.is_dir():
+            raise NotADirectoryError(f'copy_project requires a project directory: {path}')
         original = tomlkit.parse((path / 'pyproject.toml').read_text(encoding='utf-8')).unwrap() if (path / 'pyproject.toml').exists() else {}
         name = original.get('project', {}).get('name', 'project')
         workdir = bundle.add(path, name)
-        if name != 'recursiverpc' and (path / 'pyproject.toml').is_file() and original.get('tool', {}).get('uv', {}).get('package') is not False:
+        package = original.get('tool', {}).get('uv', {}).get('package')
+        buildable = package is True or (package is not False and 'build-system' in original)
+        if name != 'recursiverpc' and buildable:
             dependencies = data['project'].setdefault('dependencies', [])
             if not any(canonicalize_name(Requirement(item).name) == canonicalize_name(name) for item in dependencies):
                 dependencies.append(name)
@@ -151,10 +185,10 @@ def extract_sources(directory: str, archive: bytes):
 
 
 def expose_project(directory: str, workdir: str):
-    import site
+    import sysconfig
     root = Path(directory).resolve()
     project = (root / workdir).resolve()
     assert root.name.startswith('recursiverpc-') and project.is_relative_to(root / 'local')
     import_path = project / 'src' if (project / 'src').is_dir() else project
-    target = Path(site.getsitepackages()[0]) / 'recursiverpc-local-project.pth'
+    target = Path(sysconfig.get_path('purelib')) / 'recursiverpc-local-project.pth'
     target.write_text(str(import_path) + '\n', encoding='utf-8')

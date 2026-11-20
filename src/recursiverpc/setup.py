@@ -50,6 +50,10 @@ def setup_driver(language, content, directory, workdir):
     os.environ['VIRTUAL_ENV'] = str(environment)
     os.environ['PATH'] = str(Path(sys.executable).parent) + os.pathsep + os.environ.get('PATH', '')
     os.environ['RECURSIVERPC_PROJECT_DIR'] = str(root)
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if callable(reconfigure):
+            reconfigure(encoding='utf-8')
     suffix = {'python': '.py', 'bash': '.sh', 'powershell': '.ps1', 'cmd': '.cmd'}[language]
     path = root / ('worker_setup' + suffix)
     encoding = 'utf-8-sig' if language == 'powershell' else 'utf-8'

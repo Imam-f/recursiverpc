@@ -1,23 +1,14 @@
-$env:Path = "C:\Users\User\.local\bin;$env:Path
+# RecursiveRPC
 
-uv init recursiverpc --lib
-uv add multiprocess dill rpyc
-uv venv
-uv sync
-uv pip install -e .
-.\.venv\Scripts\activate.ps1
-uv run --script .\rpyc_classic.py
-uv run .\test.py
-New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -PropertyType String -Force
-New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value "C:\Program Files\Git\bin\bash.exe" -PropertyType String -Force
+RecursiveRPC is a Python library for running functions across local processes
+and remote machines over SSH. Built on RPyC, it provides synchronous and
+asynchronous calls, parallel mapping, and nested proxy gateways through a shared
+worker-pool interface.
 
-dependency
-    uv
-    rpyc
-    paramiko
-    plumbum
-    ssh
-    dill
+Workers can use isolated temporary uv projects with declared dependencies,
+bundled local source code, and custom setup scripts. Compatible SSH workers reuse
+copied virtual environments to avoid downloading packages remotely. Deployment
+supports Linux Bash, Windows Git Bash, PowerShell, and cmd.
 
 ## Worker dependencies
 
@@ -62,9 +53,10 @@ name (for example `Pillow`) or the imported module object (`PIL`). A `.py` file
 containing a uv header is also accepted.
 
 For a pyproject input, runtime `[project].dependencies`, Python constraints, and
-uv sources/index configuration are used. The caller's project itself and dev
-dependency groups are not installed. Relative source paths are resolved relative
-to that pyproject; external local sources must also be accessible on remote hosts.
+uv sources/index configuration are used. By default, the caller's project itself
+and dev dependency groups are not installed. Relative source paths are resolved
+relative to that pyproject; enable `copy_local_dependencies` to bundle them instead
+of requiring those original paths to be accessible on remote hosts.
 The worker's Python requirement must be compatible with this library's supported
 Python version. Dependency-resolution or installation errors stop pool creation.
 
@@ -76,6 +68,58 @@ Omitting `dependency` retains the caller-environment dependency selection;
 runtime dependencies.
 Existing RPC `(host, port)` connections cannot be reconfigured with dependencies;
 use a managed `SSHConnection` worker to create a new environment.
+
+### Local projects and setup scripts
+
+```python
+with Recursive_RPC(
+    clients,
+    dependency=Path("pyproject.toml"),
+    copy_local_dependencies=True,
+    copy_project=True,
+    setup_script=Path("setup_worker.py"),
+) as pool:
+    result = pool.apply(task, 123)
+```
+
+`copy_local_dependencies=True` bundles local path sources, `file://` requirements,
+installed editable dependencies, and uv workspace members. Nested local sources
+are included recursively, and paths are rewritten for the temporary project.
+This also allows compatible copied venvs to use editable packages after the
+controller's original source directories have been removed.
+
+`copy_project=True` includes the project containing the dependency pyproject, or
+the current directory for requirement-list inputs. A different source directory
+can be selected with `copy_project=Path("application")`. Buildable projects are
+installed from the copied source; plain/virtual projects are added to the worker's
+import path. Tasks and setup scripts use the copied project as their working
+directory, so relative data-file reads work. Git ignore rules are respected when
+available; `.git`, venvs, bytecode, build output, and `.env*` files are excluded.
+Use both copy flags when the application also has local project dependencies.
+
+`setup_script` accepts inline Python or a `.py`, `.sh`, `.ps1`, `.cmd`, or `.bat`
+file. Inline native scripts can specify their language:
+
+```python
+from recursiverpc import SetupScript
+
+setup_script = "from pathlib import Path; Path('ready.txt').write_text('ready')"
+setup_script = SetupScript("printf ready > ready.txt", language="bash")
+```
+
+Hooks run noninteractively once per prepared worker environment, including proxy gateways and
+child environments, after dependencies are installed/copied and before RPC
+startup. They do not run during preparation of the controller's cached venv
+archive. Without a copied project, their working directory is the temporary
+worker project. `RECURSIVERPC_PROJECT_DIR` points to that temporary root, and the
+worker venv is active for subprocesses. Environment-variable changes in a hook
+do not automatically persist into task processes; files and package installations
+do persist. Native hooks require the corresponding interpreter on the target
+(cmd requires Windows). A nonzero exit aborts startup and cleans up the project.
+
+If these options are provided without `dependency`, the selected project's
+`pyproject.toml` is used when present; otherwise only framework dependencies are
+installed. Existing RPC-server connections cannot run these provisioning hooks.
 
 ### Copying compatible environments
 
@@ -95,7 +139,7 @@ wheel if recursiverpc is installed as editable source.
 The destination venv is rebased onto its local interpreter, activation files and
 console launchers are relocated, and installed versions, wheel compatibility,
 and framework imports are validated before startup. OS/architecture mismatches,
-missing compatible interpreters, external editable paths, or failed validation
+missing compatible interpreters, unbundled external editable paths, or failed validation
 fall back to the usual uv installation. A failed partial copy is removed first.
 
 ## SSH login shells
