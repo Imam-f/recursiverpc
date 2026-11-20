@@ -61,11 +61,11 @@ def main():
 
     # print("connecting")
     # print(HOSTNAME, USER, PORT, PASSWORD)
-    sshmachine = ParamikoMachine(host=HOSTNAME,
-                                 user=USER,
-                                 port=PORT,
-                                 password=PASSWORD,
-                                 missing_host_policy=paramiko.AutoAddPolicy())
+    # sshmachine = ParamikoMachine(host=HOSTNAME,
+    #                              user=USER,
+    #                              port=PORT,
+    #                              password=PASSWORD,
+    #                              missing_host_policy=paramiko.AutoAddPolicy())
 
     # puttymachine = PuttyMachine(host=HOSTNAME,
     #                              user=USER,
