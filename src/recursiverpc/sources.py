@@ -11,6 +11,7 @@ import subprocess
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 import zipfile
+from .artifacts import Artifact
 
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
@@ -51,7 +52,7 @@ def _workspace_source(origin: Path, name: str) -> Path:
 class SourceBundle:
     def __init__(self, follow_dependencies: bool = True):
         self.destinations: dict[Path, str] = {}
-        self.files: dict[str, tuple[bytes, int]] = {}
+        self.files: dict[str, tuple[bytes | Path, int]] = {}
         self.sources: dict[str, dict] = {}
         self.follow_dependencies = follow_dependencies
 
@@ -66,7 +67,7 @@ class SourceBundle:
             target += '/' + source.name
         self.destinations[source] = target
         if source.is_file():
-            self.files[target] = source.read_bytes(), source.stat().st_mode
+            self.files[target] = source, source.stat().st_mode
             return target
         try:
             tracked = subprocess.run(['git', '-C', str(source), 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
@@ -83,7 +84,7 @@ class SourceBundle:
             if path.is_symlink() and not path.resolve().is_relative_to(source):
                 raise ValueError(f'External source symlink cannot be bundled: {path}')
             if path.is_file():
-                self.files[target + '/' + relative.as_posix()] = path.read_bytes(), path.stat().st_mode
+                self.files[target + '/' + relative.as_posix()] = path, path.stat().st_mode
         project = source / 'pyproject.toml'
         if project.is_file() and self.follow_dependencies:
             data = tomlkit.parse(project.read_text(encoding='utf-8')).unwrap()
@@ -130,19 +131,22 @@ class SourceBundle:
                 entry['path'] = os.path.relpath(destination, target or '.').replace('\\', '/')
         uv.pop('workspace', None)
 
-    def archive(self) -> bytes:
-        stream = io.BytesIO()
-        with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+    def archive(self) -> Artifact:
+        stream = Artifact()
+        with zipfile.ZipFile(stream.path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
             for name, (content, mode) in self.files.items():
                 entry = zipfile.ZipInfo(name)
                 entry.external_attr = (mode & 0o777) << 16
                 entry.compress_type = zipfile.ZIP_DEFLATED
-                archive.writestr(entry, content)
-        return stream.getvalue()
+                if isinstance(content, Path):
+                    archive.write(content, name)
+                else:
+                    archive.writestr(entry, content)
+        return stream
 
 
 def bundle_sources(project: str, origin: str | None, copy_dependencies: bool,
-                   copy_project: bool | str | os.PathLike[str]) -> tuple[str, bytes, str | None]:
+                   copy_project: bool | str | os.PathLike[str]) -> tuple[str, bytes | Artifact, str | None]:
     data = tomlkit.parse(project).unwrap()
     root = Path(origin) if origin else Path.cwd()
     bundle = SourceBundle(follow_dependencies=copy_dependencies)
@@ -169,16 +173,35 @@ def bundle_sources(project: str, origin: str | None, copy_dependencies: bool,
     return tomlkit.dumps(data), bundle.archive() if bundle.files else b'', workdir
 
 
-def extract_sources(directory: str, archive: bytes):
+def extract_sources(directory: str, archive):
     root = Path(directory).resolve()
     assert root.name.startswith('recursiverpc-')
-    with zipfile.ZipFile(io.BytesIO(archive)) as source:
+    import contextlib
+    import tempfile
+    with contextlib.ExitStack() as stack:
+        if isinstance(archive, bytes):
+            stream = io.BytesIO(archive)
+        elif hasattr(archive, 'seek'):
+            stream = archive
+        else:
+            stream = stack.enter_context(tempfile.TemporaryFile())
+            offset = 0
+            while True:
+                block = archive.read(offset, 1024 * 1024)
+                if not block:
+                    break
+                stream.write(block)
+                offset += len(block)
+            stream.seek(0)
+        source = stack.enter_context(zipfile.ZipFile(stream))
         for entry in source.infolist():
             path = (root / entry.filename).resolve()
             if not path.is_relative_to(root / 'local') or entry.is_dir():
                 raise ValueError('Invalid local source archive path')
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(source.read(entry))
+            import shutil
+            with source.open(entry) as incoming, path.open("wb") as outgoing:
+                shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
             mode = (entry.external_attr >> 16) & 0o777
             if mode:
                 path.chmod(mode)

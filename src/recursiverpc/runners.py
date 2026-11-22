@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import weakref
 import os
 import random
 import re
 import subprocess
 import sys
 import tempfile
+from threading import RLock
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -48,7 +50,20 @@ class Runner:
     def run(self, func, /, *args, **kwargs):
         raise NotImplementedError
 
-    def close(self): ...
+    def close(self, wait=True, cancel_pending=False): ...
+
+    def _track(self, handle):
+        with self._handles_lock:
+            self.process_handle.append(handle)
+        owner_ref, handle_ref = weakref.ref(self), weakref.ref(handle)
+        def completed(_):
+            owner, finished = owner_ref(), handle_ref()
+            if owner is not None and finished is not None:
+                with owner._handles_lock:
+                    if finished in owner.process_handle:
+                        owner.process_handle.remove(finished)
+        handle.result.add_done_callback(completed)
+        return handle
 
     def status(self):
         raise NotImplementedError
@@ -65,21 +80,20 @@ class ProcessRunner(Runner):
         self.pool: "Pool" = Pool(num, dependency=dependency)
         self.process_num = self.pool.max_workers
         self.process_handle: list[RPC_Future] = []
+        self._handles_lock = RLock()
 
     def run(self, func, /, *args, **kwargs) -> RPC_Future:
         result = self.pool.apply_async(func, args, kwargs)
-        self.process_handle.append(RPC_Future(result, self))
-        return self.process_handle[-1]
+        return self._track(RPC_Future(result, self))
 
-    def close(self):
-        self.pool.close()
+    def close(self, wait=True, cancel_pending=False):
+        self.pool.close(wait=wait, cancel_pending=cancel_pending)
 
     def status(self) -> tuple[bool, int, int, int]:
-        for i, v in enumerate(self.process_handle):
-            if self.process_handle[i].status():
-                self.process_handle.remove(v)
+        with self._handles_lock:
+            self.process_handle[:] = [f for f in self.process_handle if not f.status()]
 
-        is_pool_active: bool = not not self.pool
+        is_pool_active: bool = not getattr(self.pool, "_closed", False)
         process_num: int = self.process_num
         not_done_count: int = len(self.process_handle)
 
@@ -100,6 +114,7 @@ class NetworkRunner(Runner):
     ):
         self.process_num = num
 
+        self._closed = False
         self.server = None
         self.conn = None
         self.machine = None
@@ -125,18 +140,15 @@ class NetworkRunner(Runner):
 
                     # Generate requirements and script header
                     header = "#!/usr/bin/env uv run --script\n"
-                    curdir = os.getcwd()
 
                     with tempfile.TemporaryDirectory() as temp_dir:
                         temp_dir = Path(temp_dir)
                         # Generate requirements.txt using uv
-                        os.chdir(temp_dir)
-                        self._generate_requirements()
+                        self._generate_requirements(temp_dir)
 
                         # Create util.py and add dependencies
                         Path(temp_dir / "util.py").touch()
-                        self._add_script_dependencies()
-                        os.chdir(curdir)
+                        self._add_script_dependencies(temp_dir)
 
                         # Read and process the generated script
                         with open(temp_dir / "util.py", "r") as f:
@@ -187,6 +199,7 @@ class NetworkRunner(Runner):
         self.pool = self.conn.namespace["pool"]
 
         self.process_handle: list[RPC_Future] = []
+        self._handles_lock = RLock()
 
     def _check_uv_available(self) -> bool:
         result = subprocess.run(
@@ -194,14 +207,14 @@ class NetworkRunner(Runner):
         )
         return result.returncode == 0
 
-    def _generate_requirements(self):
+    def _generate_requirements(self, directory):
         result = subprocess.run(
             [self.uv_bin, "pip", "freeze"], capture_output=True, text=True, check=True
         )
-        with open("requirements.txt", "w") as f:
+        with open(Path(directory) / "requirements.txt", "w") as f:
             f.write(result.stdout)
 
-    def _add_script_dependencies(self):
+    def _add_script_dependencies(self, directory):
         """Add dependencies to script using uv"""
         result = subprocess.run(
             [
@@ -213,7 +226,7 @@ class NetworkRunner(Runner):
                 "--script",
                 "util.py",
             ],
-            capture_output=True,
+            capture_output=True, cwd=directory, check=True,
         )
         log.debug("uv script dependency setup returned %s", result.returncode)
 
@@ -258,24 +271,27 @@ class NetworkRunner(Runner):
             return ""
 
     def run(self, func, /, *args, **kwargs) -> RPC_Future:
-        if self.conn is None:
-            raise RuntimeError("No connection")
+        if self._closed or self.conn is None:
+            raise RuntimeError("Network runner is closed")
 
-        self.conn.teleport(func)
-        self.conn.namespace["args"] = args
-        self.conn.namespace["kwargs"] = kwargs
-        self.conn.namespace["result"] = self.pool.apply_async(
-            func, self.conn.namespace["args"], self.conn.namespace["kwargs"]
-        )
-        result = self.conn.namespace["result"]
-        self.process_handle.append(RPC_Future(result, self))
-        return self.process_handle[-1]
+        function = self.conn.teleport(func)
+        result = self.pool.apply_async(function, args, kwargs)
+        return self._track(RPC_Future(result, self))
 
-    def close(self):
+    def close(self, wait=True, cancel_pending=False):
+        self._closed = True
+        if not wait:
+            from threading import Thread
+            Thread(target=self.close, kwargs={"cancel_pending": cancel_pending}, daemon=True).start()
+            return
+        with self.__dict__.setdefault('_close_lock', RLock()):
+            self._close_resources(wait, cancel_pending)
+
+    def _close_resources(self, wait, cancel_pending):
         log.debug("Closing network runner")
         try:
             if self.conn is not None:
-                self.pool.close()
+                self.pool.close(wait=wait, cancel_pending=cancel_pending)
         except Exception:
             log.debug("Failed to close remote worker pool", exc_info=True)
         try:
@@ -302,9 +318,8 @@ class NetworkRunner(Runner):
         self.close()
 
     def status(self) -> tuple[bool, int, int, int]:
-        for i, v in enumerate(self.process_handle):
-            if self.process_handle[i].status():
-                self.process_handle.remove(v)
+        with self._handles_lock:
+            self.process_handle[:] = [f for f in self.process_handle if not f.status()]
 
         is_pool_active: bool = not not self.conn
         process_num: int = self.process_num
@@ -327,6 +342,7 @@ class ProxyRunner(Runner):
         ssh_remote: Dict[str, Tuple] | None = None,
         dependency: DependencySpec | None = None,
     ):
+        self._closed = False
         self.host = host
         self.port = port
         self.num = num
@@ -335,6 +351,7 @@ class ProxyRunner(Runner):
         self.weight: list[int] = []
         self.connection: list[Runner] = []
         self.process_handle: list[RPC_Future] = []
+        self._handles_lock = RLock()
         self.conn = None
         self._gateway = None
         self._remote_proxy = None
@@ -422,11 +439,15 @@ class ProxyRunner(Runner):
                 raise TypeError("Invalid runner descriptor")
 
     def schedule(self):
+        if getattr(self, "_closed", False):
+            raise RuntimeError("Proxy runner is closed")
         if not self.connection:
             raise RuntimeError("No runner")
         return random.choices(self.connection, weights=self.weight, k=1)[0]
 
     def run(self, func, /, *args, **kwargs):
+        if getattr(self, "_closed", False):
+            raise RuntimeError("Proxy runner is closed")
         if self._remote_proxy is not None:
             if self.conn is None:
                 raise RuntimeError("Gateway RPC connection is closed")
@@ -434,10 +455,20 @@ class ProxyRunner(Runner):
             result = self._remote_proxy.run(remote_func, *args, **kwargs)
         else:
             result = self.schedule().run(func, *args, **kwargs)
-        self.process_handle.append(result)
-        return result
+        if isinstance(result, RPC_Future) and not isinstance(result, rpyc.core.netref.BaseNetref):
+            return self._track(result)
+        return self._track(RPC_Future(result.result, self))
 
-    def close(self):
+    def close(self, wait=True, cancel_pending=False):
+        self._closed = True
+        if not wait:
+            from threading import Thread
+            Thread(target=self.close, kwargs={"cancel_pending": cancel_pending}, daemon=True).start()
+            return
+        with self.__dict__.setdefault('_close_lock', RLock()):
+            self._close_resources(wait, cancel_pending)
+
+    def _close_resources(self, wait, cancel_pending):
         errors = []
         resources = [*self.connection, self._remote_proxy, self._gateway]
         self.connection.clear()
@@ -449,13 +480,14 @@ class ProxyRunner(Runner):
         for resource in resources:
             if resource is not None:
                 try:
-                    resource.close()
+                    resource.close(wait=wait, cancel_pending=cancel_pending)
                 except Exception as exc:
                     errors.append(exc)
         if errors:
             raise errors[0]
 
     def status(self) -> tuple[bool, int, int, int]:
-        self.process_handle = [f for f in self.process_handle if not f.status()]
+        with self._handles_lock:
+            self.process_handle[:] = [f for f in self.process_handle if not f.status()]
         active = self._remote_proxy is not None or bool(self.connection)
         return active, self.process_num, len(self.process_handle), 0

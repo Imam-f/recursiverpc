@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
+from .artifacts import Artifact, upload_artifact
 import inspect
+import hashlib
+from functools import lru_cache
 import io
 import json
 import logging
@@ -18,7 +20,7 @@ import zipfile
 from packaging.specifiers import SpecifierSet
 
 log = logging.getLogger(__name__)
-Bundle = tuple[str, bytes]
+Bundle = tuple[str, Artifact | bytes]
 
 
 def runtime_info():
@@ -75,8 +77,8 @@ def archive_environment(prefix: Path, framework: tuple[str, bytes] | None = None
         'import importlib.metadata as m,json; print(json.dumps({d.metadata["Name"]:d.version for d in m.distributions()}))',
     ], check=True, capture_output=True, text=True)
     info['packages'] = json.loads(versions.stdout)
-    stream = io.BytesIO()
-    with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=3) as archive:
+    stream = Artifact()
+    with zipfile.ZipFile(stream.path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=3) as archive:
         for directory in (site, prefix / ('Scripts' if os.name == 'nt' else 'bin')):
             for path in directory.rglob('*'):
                 if path.is_symlink() and path.is_dir():
@@ -107,11 +109,24 @@ def archive_environment(prefix: Path, framework: tuple[str, bytes] | None = None
                 for entry in wheel.infolist():
                     if not entry.is_dir():
                         archive.writestr('.venv/' + info['site_relative'] + '/' + entry.filename, wheel.read(entry))
-    return json.dumps(info), stream.getvalue()
+    return json.dumps(info), stream
 
 
-@lru_cache(maxsize=1)
 def current_environment_bundle() -> Bundle:
+    # Refresh when installed files or editable framework sources change.
+    digest = hashlib.sha256(json.dumps(runtime_info(), sort_keys=True).encode())
+    site = Path(runtime_info()['site'])
+    for path in sorted(site.rglob('*')):
+        if path.is_file() and '__pycache__' not in path.parts and path.suffix not in ('.pyc', '.pyo'):
+            stat = path.stat()
+            digest.update(str((str(path), stat.st_size, stat.st_mtime_ns)).encode())
+    for path in sorted(Path(__file__).parent.rglob('*.py')):
+        digest.update(path.read_bytes())
+    return _current_environment_bundle(digest.hexdigest())
+
+
+@lru_cache(maxsize=2)
+def _current_environment_bundle(identity: str) -> Bundle:
     if sys.prefix == sys.base_prefix:
         raise ValueError('The controller is not running in a virtual environment')
     # Editable recursiverpc code lives outside the venv; include a real wheel.
@@ -169,6 +184,13 @@ with zipfile.ZipFile(root/'.venv-copy.zip') as archive:
         assert path.is_relative_to(venv.resolve()), 'Invalid environment archive path'
         assert not entry.is_dir(), 'Unexpected directory entry'
         path.parent.mkdir(parents=True,exist_ok=True)
+        if path.parent.name not in ('Scripts','bin') and path.suffix not in ('.pth','.egg-link') and not path.name.startswith('__editable__'):
+            import shutil
+            with archive.open(entry) as incoming, path.open('wb') as outgoing:
+                shutil.copyfileobj(incoming,outgoing,1024*1024)
+            mode=(entry.external_attr>>16)&0o777
+            if mode: path.chmod(mode)
+            continue
         content=archive.read(entry)
         if data.get('project_prefix') and (path.suffix in ('.pth','.egg-link') or path.name.startswith('__editable__')):
             before=data['project_prefix']
@@ -221,7 +243,7 @@ def try_copy_environment(remote, directory: str, bundle_factory: Callable[[], Bu
         remote.command('uv')('venv', environment, '--python', interpreter,
                              '--relocatable', '--no-python-downloads')
         remote.write_file(directory, '.venv-copy.json', profile.encode('utf-8'))
-        remote.write_file(directory, '.venv-copy.zip', archive)
+        upload_artifact(remote, directory, '.venv-copy.zip', archive)
         executable = json.loads(remote.python_run(RESTORE_SCRIPT.replace('DIRECTORY', repr(directory))))
         verification = (
             'import json,importlib.metadata as m,pathlib; '

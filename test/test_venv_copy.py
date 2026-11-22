@@ -78,7 +78,7 @@ class RelocationTests(unittest.TestCase):
         profile, archive = spec.environment_bundle()
         info = json.loads(profile)
         self.assertFalse(Path(info['prefix']).exists())
-        with zipfile.ZipFile(io.BytesIO(archive)) as contents:
+        with zipfile.ZipFile(archive.path) as contents:
             self.assertFalse(any('__pycache__' in name for name in contents.namelist()))
             self.assertNotIn('.venv/pyvenv.cfg', contents.namelist())
         remote = LocalShell('cmd' if os.name == 'nt' else 'linux')

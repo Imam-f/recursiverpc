@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 import random
 from pathlib import Path
+from threading import Condition
+from collections import deque
+from concurrent.futures import wait, FIRST_COMPLETED
 from typing import Any, Callable, Dict, Generator, Tuple, TypeVar
 
 from .config import localprocess, networkprocess, proxyprocess
@@ -25,10 +28,16 @@ class Recursive_RPC:
         conn: Dict[str, Tuple] | None = None,
         dependency: DependencyInput | DependencySpec | None = None,
         *,
+        max_pending: int | None = None,
         copy_local_dependencies: bool = False,
         copy_project: bool | str | os.PathLike[str] = False,
         setup_script: SetupScript | str | os.PathLike[str] | None = None,
     ):
+        if max_pending is not None and max_pending < 0:
+            raise ValueError("max_pending must be nonnegative")
+        self._condition = Condition()
+        self._closed = False
+        self._outstanding = 0
         if dependency is None and (
             copy_local_dependencies or copy_project or setup_script is not None
         ):
@@ -61,6 +70,7 @@ class Recursive_RPC:
             except Exception:
                 pass
             raise
+        self.max_pending = sum(self.weight) * 2 if max_pending is None else max_pending
         if not any(self.connection):
             raise RuntimeError("No runner")
 
@@ -68,70 +78,97 @@ class Recursive_RPC:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def close(self, wait=True, cancel_pending=False):
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
         errors = []
         for connection in self.connection:
             if connection is not None:
                 try:
-                    connection.close()
+                    connection.close(wait=wait, cancel_pending=cancel_pending)
                 except Exception as error:
                     errors.append(error)
-        self.connection.clear()
         if errors:
             raise errors[0]
 
     def schedule(self) -> "Runner":
 
+        if self._closed:
+            raise RuntimeError("Scheduler is closed")
         rand = random.choices(self.connection, weights=self.weight, k=1)[0]
         if not rand:
             raise RuntimeError("No runner")
         return rand
 
     def apply(self, func: Callable[[Any], T], /, *args, **kwargs) -> T:
-        runner: Runner = self.schedule()
-        if not runner:
-            raise RuntimeError("No runner")
-        result: RPC_Future = runner.run(func, *args, **kwargs)
-        return result.get()
+        return self.apply_async(func, *args, **kwargs).get()
 
     def apply_async(self, func, /, *args, **kwargs) -> "RPC_Future":
-        runner: Runner = self.schedule()
-        if not runner:
-            raise RuntimeError("No runner")
-        return runner.run(func, *args, **kwargs)
+        with self._condition:
+            while not self._closed and self._outstanding >= sum(self.weight) + self.max_pending:
+                self._condition.wait()
+            if self._closed:
+                raise RuntimeError("Scheduler is closed")
+            self._outstanding += 1
+        def released(_):
+            with self._condition:
+                self._outstanding -= 1
+                self._condition.notify_all()
+        try:
+            handle = self.schedule().run(func, *args, **kwargs)
+        except BaseException:
+            released(None)
+            raise
+        handle.result.add_done_callback(released)
+        return handle
+
+    def imap(self, iters, func, /, *args, **kwargs):
+        """Yield completion-order results with a bounded input window."""
+        yield from self._imap(iters, func, args, kwargs, ordered=False)
+
+    def imap_ordered(self, iters, func, /, *args, **kwargs):
+        """Yield input-order results with a bounded input window."""
+        yield from self._imap(iters, func, args, kwargs, ordered=True)
+
+    def _imap(self, iters, func, args, kwargs, ordered):
+        iterator = iter(iters)
+        pending = deque()
+        exhausted = False
+        window = sum(self.weight) + self.max_pending
+        while pending or not exhausted:
+            while not exhausted and len(pending) < window:
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    exhausted = True
+                    break
+                pending.append(self.apply_async(func, item, *args, **kwargs))
+            if not pending:
+                break
+            if ordered:
+                handle = pending.popleft()
+            else:
+                ready, _ = wait([h.result for h in pending], return_when=FIRST_COMPLETED)
+                handle = next(h for h in pending if h.result in ready)
+                pending.remove(handle)
+            yield handle.get()
 
     def map_ordered(self, iters, func, /, *args, **kwargs):
-        future_list: list["RPC_Future"] = []
-        for i in iters:
-            runner: Runner = self.schedule()
-            if not runner:
-                raise RuntimeError("No runner")
-            r = runner.run(func, *[i, *args], **kwargs)
-            future_list.append(r)
-        return [f.get() for f in future_list]
+        return list(self.imap_ordered(iters, func, *args, **kwargs))
 
     def map_ordered_async(self, iters, func, /, *args, **kwargs) -> list["RPC_Future"]:
         return self.map_async(iters, func, *args, **kwargs)
 
     def map(self, iters, func, /, *args, **kwargs):
-        future_list: list["RPC_Future"] = []
-        for i in iters:
-            runner: Runner = self.schedule()
-            if not runner:
-                raise RuntimeError("No runner")
-            r = runner.run(func, *[i, *args], **kwargs)
-            future_list.append(r)
-        return [f for f in RPC_Future.as_completed(future_list)]
+        return list(self.imap(iters, func, *args, **kwargs))
 
     def map_async(self, iters, func, /, *args, **kwargs) -> list["RPC_Future"]:
-        future_list: list["RPC_Future"] = []
-        for i in iters:
-            runner: Runner = self.schedule()
-            if not runner:
-                raise RuntimeError("No runner")
-            r = runner.run(func, *[i, *args], **kwargs)
-            future_list.append(r)
-        return future_list
+        # Compatibility API retains handles; imap variants also bound result storage.
+        return [self.apply_async(func, item, *args, **kwargs) for item in iters]
 
     @staticmethod
-    def as_completed(cls_act: list["RPC_Future"]) -> Generator[Any, None, None]:
-        yield from RPC_Future.as_completed(cls_act)
+    def as_completed(cls_act: list["RPC_Future"], timeout=None) -> Generator[Any, None, None]:
+        yield from RPC_Future.as_completed(cls_act, timeout=timeout)

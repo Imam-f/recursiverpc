@@ -5,6 +5,8 @@ import json
 import re
 import shlex
 import subprocess
+import time
+import shutil
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 import paramiko
@@ -85,21 +87,33 @@ class SSHProcess(ParamikoPopen):
         self.channel.close()
 
     def communicate(self, input: bytes | None = None, timeout: float | None = None):
-        if input is not None:
-            self.stdin.write(input)
-        self.terminate()
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        def remaining():
+            return None if deadline is None else max(0, deadline - time.monotonic())
+        def send():
+            if input is not None:
+                if hasattr(input, "read"):
+                    shutil.copyfileobj(input, self.stdin, length=256 * 1024)
+                else:
+                    self.stdin.write(input)
+            self.terminate()
+        executor = ThreadPoolExecutor(max_workers=4)
+        try:
             stdout = executor.submit(self.stdout.read)
             stderr = executor.submit(self.stderr.read)
-            try:
-                result = stdout.result(timeout), stderr.result(timeout)
-            except FutureTimeout:
-                self.kill()
-                if timeout is None:
-                    raise
-                raise subprocess.TimeoutExpired(self.argv, timeout)
-        self.wait()
-        return result
+            writer = executor.submit(send)
+            writer.result(remaining())
+            result = stdout.result(remaining()), stderr.result(remaining())
+            executor.submit(self.wait).result(remaining())
+            return result
+        except FutureTimeout:
+            self.kill()
+            raise subprocess.TimeoutExpired(self.argv, timeout) from None
+        except BaseException:
+            self.kill()
+            raise
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
 
 class ShellAwareMachine:
@@ -239,6 +253,58 @@ class ShellAwareMachine:
             "p.write_bytes(sys.stdin.buffer.read()); print(json.dumps(str(p)))",
             input=content,
         ))
+
+    def write_artifact(self, directory, name, artifact):
+        """Reuse a verified content-addressed archive, uploading bounded chunks."""
+        import uuid
+        if not name or '/' in name or '\\' in name or name in ('.', '..'):
+            raise ValueError('Expected an artifact file name')
+        digest = artifact.digest()
+        if not re.fullmatch('[0-9a-f]{64}', digest):
+            raise ValueError('Invalid artifact digest')
+        prelude = (
+            "import pathlib,tempfile,hashlib,shutil,os\n"
+            "cache=pathlib.Path(tempfile.gettempdir())/'recursiverpc-artifacts'\n"
+            "cache.mkdir(exist_ok=True)\n"
+            "cached=cache/" + repr(digest) + "\n"
+            "target=pathlib.Path(" + repr(directory) + ")/" + repr(name) + "\n"
+            "def checksum(path):\n"
+            "    value=hashlib.sha256()\n"
+            "    with path.open('rb') as stream:\n"
+            "        for block in iter(lambda:stream.read(1048576),b''): value.update(block)\n"
+            "    return value.hexdigest()\n"
+        )
+        hit = self.python_run(prelude +
+            "try:\n"
+            "    if cached.is_file() and checksum(cached)==" + repr(digest) + ":\n"
+            "        shutil.copyfile(cached,target)\n        os.utime(cached,None)\n        print('HIT')\n"
+            "except OSError: pass")
+        if hit == 'HIT':
+            return str(directory).rstrip('/\\') + '/' + name
+        temporary = digest + '-' + uuid.uuid4().hex + '.part'
+        temporary_code = "partial=cache/" + repr(temporary) + "\n"
+        try:
+            self.python_run(prelude + temporary_code + "partial.touch(exist_ok=False)")
+            offset = 0
+            while True:
+                block = artifact.read(offset, 1024 * 1024)
+                if not block:
+                    break
+                self.python_run(prelude + temporary_code +
+                    "import sys\nwith partial.open('ab') as output: shutil.copyfileobj(sys.stdin.buffer,output,1048576)", input=block)
+                offset += len(block)
+            self.python_run(prelude + temporary_code +
+                "assert checksum(partial)==" + repr(digest) + ", 'Artifact checksum mismatch'\n"
+                "shutil.copyfile(partial,target)\nos.replace(partial,cached)\n"
+                "entries=[]\n"
+                "for p in cache.iterdir():\n"
+                "    try:\n        if len(p.name)==64: entries.append((p.stat().st_mtime,p))\n"
+                "    except OSError: pass\n"
+                "for _,old in sorted(entries,reverse=True)[4:]:\n"
+                "    try: old.unlink()\n    except OSError: pass")
+        finally:
+            self.python_run(prelude + temporary_code + "partial.unlink(missing_ok=True)")
+        return str(directory).rstrip('/\\') + '/' + name
 
     def remove_temp_dir(self, directory):
         self.python_run(

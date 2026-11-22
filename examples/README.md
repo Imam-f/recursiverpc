@@ -37,6 +37,12 @@ yields **result values**, rather than futures. The synchronous `pool.map(...)`
 returns a list of values in completion order; `map_ordered(...)` preserves input
 order. Completion order and worker process IDs can vary between runs.
 
+Submission now waits when the bounded pending-work limit is full. This means
+`apply_async()` and `map_async()` may wait for capacity before returning; the
+result shapes and ordering shown here are unchanged. Use `max_pending=` to
+adjust the allowance, or `imap()` / `imap_ordered()` to stream larger inputs
+without keeping every result handle in a list.
+
 Task functions import the modules they need inside their bodies. Function
 teleportation does not automatically copy the caller's module globals or an
 application source tree. Keep the `if __name__ == "__main__"` guards when adapting

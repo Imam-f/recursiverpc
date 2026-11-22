@@ -98,7 +98,7 @@ class SourceTests(unittest.TestCase):
             spec = parse_dependency(app / 'pyproject.toml').configured(copy_local_dependencies=True, copy_project=True)
             self.assertNotIn(str(helper), spec.project)
             self.assertIsNotNone(spec.workdir)
-            with zipfile.ZipFile(io.BytesIO(spec.files)) as archive:
+            with zipfile.ZipFile(spec.files.path) as archive:
                 self.assertTrue(any(name.endswith('rpc_local_helper/__init__.py') for name in archive.namelist()))
                 self.assertFalse(any(name.endswith('.env') for name in archive.namelist()))
 

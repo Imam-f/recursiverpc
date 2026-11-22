@@ -290,3 +290,33 @@ fail instead of silently skipping them. CI never needs a remote SSH host.
 
 Historical infrastructure experiments live in [experiments/](experiments/README.md).
 Use [examples/](examples/README.md) for small, current library demonstrations.
+
+## Bounded execution and shutdown
+
+`Recursive_RPC(..., max_pending=N)` limits unfinished submissions to the total
+worker count plus `N`. The default pending allowance is twice the worker count.
+Submission waits when that limit is reached. Each pool uses one dispatch thread
+per worker connection; it also bounds its own queue. `Pool(..., max_pending=N)`
+configures that queue directly.
+
+Use `imap(items, function)` for streaming completion-order results or
+`imap_ordered(items, function)` for streaming input-order results. Both consume
+a bounded window of input. The existing `map_async()` API still returns a list
+of all handles, so use the streaming APIs for large or unbounded inputs.
+
+`future.get(timeout=seconds)` and `RPC_Future.as_completed(handles, timeout=seconds)`
+use notification-driven waits. A timeout leaves the task running.
+`close(wait=True, cancel_pending=False)` drains submitted work by default.
+Use `cancel_pending=True` to cancel queued tasks; running tasks finish normally.
+`wait=False` starts cleanup in the background. Submissions after close raise
+`RuntimeError`. Context managers wait for cleanup.
+
+Source and environment archives are backed by temporary files and transferred
+in chunks of at most 1 MiB. Remote archives are cached by SHA-256 in
+`recursiverpc-artifacts` under the remote temporary directory, verified before
+reuse, and limited to four completed entries. Each worker receives a separate
+extracted environment so setup hooks and worker changes remain isolated.
+Prepared dependency environment archives are also reused within the controller
+process by dependency specification, framework wheel, bundled source contents,
+working directory, and Python runtime profile. Setup hooks still run separately
+for each worker project.

@@ -6,6 +6,11 @@ from dataclasses import dataclass, field, replace
 from importlib import metadata
 import os
 import inspect
+import hashlib
+import json
+from collections import OrderedDict
+from threading import RLock
+from .artifacts import Artifact, upload_artifact
 from pathlib import Path
 import re
 import subprocess
@@ -19,9 +24,12 @@ from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 import tomlkit
 from uv import find_uv_bin
-from .venv import Bundle, archive_environment, try_copy_environment
+from .venv import Bundle, archive_environment, try_copy_environment, runtime_info
+
+_ENVIRONMENTS = OrderedDict()
+_ENVIRONMENT_LOCK = RLock()
 from .setup import SetupPayload, SetupScript, parse_setup, setup_code
-from .sources import bundle_sources, extract_sources, expose_project
+from .sources import SourceBundle, bundle_sources, extract_sources, expose_project
 
 DependencyInput = str | os.PathLike[str] | Sequence[str | ModuleType]
 
@@ -103,7 +111,7 @@ class DependencySpec:
     wheel_name: str = ''
     wheel: bytes = b''
     venv: Bundle | None = field(default=None, repr=False, compare=False)
-    files: bytes = field(default=b'', repr=False)
+    files: bytes | Artifact = field(default=b'', repr=False)
     setup: SetupPayload | None = None
     workdir: str | None = None
     origin: str | None = field(default=None, repr=False, compare=False)
@@ -134,16 +142,41 @@ class DependencySpec:
         return replace(self, project=project, files=files, workdir=workdir, setup=setup, venv=None)
 
     def environment_bundle(self) -> Bundle:
-        if self.venv is None:
-            project = LocalProject(self, run_setup=False)
+        if self.venv is not None:
+            return self.venv
+        source_digest = (hashlib.sha256(self.files).hexdigest() if isinstance(self.files, bytes)
+                         else self.files.digest())
+        # Absolute local dependency paths can change between specifications even
+        # when the requirement text is unchanged. Include their source contents.
+        local = SourceBundle()
+        sources = tomlkit.parse(self.project).get('tool', {}).get('uv', {}).get('sources', {})
+        for name, entries in sources.items():
+            for entry in entries if isinstance(entries, list) else [entries]:
+                if isinstance(entry, dict) and 'path' in entry and Path(entry['path']).is_absolute():
+                    local.add(Path(entry['path']), name)
+        local_digest = ''
+        if local.files:
+            artifact = local.archive()
             try:
-                bundle = archive_environment(project.path / '.venv', project_root=project.path)
+                local_digest = artifact.digest()
             finally:
-                project.close()
-            # This is a transport cache; the dependency specification is unchanged.
+                artifact.close()
+        identity = (self.project, self.workdir, hashlib.sha256(self.wheel).hexdigest(),
+                    source_digest, local_digest, json.dumps(runtime_info(), sort_keys=True))
+        with _ENVIRONMENT_LOCK:
+            bundle = _ENVIRONMENTS.get(identity)
+            if bundle is None:
+                project = LocalProject(self, run_setup=False)
+                try:
+                    bundle = archive_environment(project.path / '.venv', project_root=project.path)
+                finally:
+                    project.close()
+                _ENVIRONMENTS[identity] = bundle
+                while len(_ENVIRONMENTS) > 4:
+                    _ENVIRONMENTS.popitem(last=False)
+            _ENVIRONMENTS.move_to_end(identity)
             object.__setattr__(self, 'venv', bundle)
-        assert self.venv is not None
-        return self.venv
+            return bundle
 
     def project_text(self) -> str:
         if not self.wheel or Path(self.wheel_name).name != self.wheel_name:
@@ -166,9 +199,9 @@ class DependencySpec:
 
     def install_remote(self, remote, directory: str) -> str | None:
         if self.files:
-            remote.write_file(directory, 'local-sources.zip', self.files)
+            upload_artifact(remote, directory, 'local-sources.zip', self.files)
             code = ('import io,zipfile\nfrom pathlib import Path\n' + inspect.getsource(extract_sources)
-                    + '\nextract_sources(' + repr(directory) + ',Path(' + repr(directory) + ").joinpath('local-sources.zip').read_bytes())")
+                    + '\nextract_sources(' + repr(directory) + ',Path(' + repr(directory) + ").joinpath('local-sources.zip').open('rb'))")
             remote.python_run(code)
         remote.write_file(directory, self.wheel_name, self.wheel)
         project = self.project_text()

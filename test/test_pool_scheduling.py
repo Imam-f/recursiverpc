@@ -1,178 +1,184 @@
-"""Pool regression tests using real threads and simulated RPC connections."""
-
-import contextlib
-import importlib
-import io
+"""Bounded scheduling, cancellation and notification regressions."""
 import threading
-from types import SimpleNamespace
+import time
 import unittest
+from concurrent.futures import Future, CancelledError, TimeoutError
+from types import SimpleNamespace
 from unittest.mock import patch
-
-rpc = importlib.import_module("recursiverpc.pool")
-
+from recursiverpc.pool import Pool
+from recursiverpc.futures import RPC_Future
+from recursiverpc.runners import ProcessRunner
+from recursiverpc import Recursive_RPC, localprocess, NetworkRunner
 
 class PoolSchedulingTests(unittest.TestCase):
     def setUp(self):
-        self.threads = []
-        self.gates = []
+        self.gate = threading.Event()
         self.pools = []
-
-        def make_thread(*args, **kwargs):
-            thread = threading.Thread(*args, **kwargs)
-            self.threads.append(thread)
-            return thread
-
-        def connection():
-            return SimpleNamespace(
-                modules=SimpleNamespace(sys=SimpleNamespace()),
-                teleport=lambda func: func,
-                close=lambda: None,
-            )
-
-        self.thread_patch = patch.object(rpc, "Thread", make_thread)
-        self.connect_patch = patch.object(
-            rpc.rpyc.classic, "connect_multiprocess", side_effect=connection
-        )
-        self.thread_patch.start()
-        self.connect_patch.start()
-        self.addCleanup(self.thread_patch.stop)
-        self.addCleanup(self.connect_patch.stop)
+        connection = lambda: SimpleNamespace(modules=SimpleNamespace(sys=SimpleNamespace()),
+                                            teleport=lambda f:f, close=lambda:None)
+        self.patch = patch('recursiverpc.pool.rpyc.classic.connect_multiprocess', side_effect=connection)
+        self.patch.start()
 
     def tearDown(self):
-        for gate in self.gates:
-            gate.set()
-        for thread in self.threads:
-            thread.join(timeout=2)
+        self.gate.set()
         for pool in self.pools:
             pool.close()
-        self.assertFalse(any(thread.is_alive() for thread in self.threads))
+        self.patch.stop()
 
-    def make_pool(self, workers):
-        pool = rpc.Pool(workers)
+    def pool(self, workers=1, pending=1):
+        pool = Pool(workers, max_pending=pending)
         self.pools.append(pool)
         return pool
 
-    def submit_blocked(self, pool):
-        gate = threading.Event()
+    def blocked(self, pool):
         started = threading.Event()
-        self.gates.append(gate)
-
         def task():
             started.set()
-            if not gate.wait(timeout=5):
-                raise TimeoutError("test did not release task")
-            return "done"
+            self.gate.wait(5)
+            return 7
+        result = pool.apply_async(task, (), {})
+        self.assertTrue(started.wait(1))
+        return result
 
-        future = pool.apply_async(task, (), {})
-        self.assertTrue(started.wait(timeout=1), "worker did not start")
-        return future, gate, self.threads[-1]
+    def test_bounded_queue_blocks_producer_and_keeps_threads_fixed(self):
+        pool = self.pool()
+        first = self.blocked(pool)
+        second = pool.apply_async(lambda: 8, (), {})
+        submitted = threading.Event()
+        def submit():
+            pool.apply_async(lambda: 9, (), {})
+            submitted.set()
+        producer = threading.Thread(target=submit)
+        producer.start()
+        self.assertFalse(submitted.wait(.05))
+        self.assertEqual(len(pool._threads), 1)
+        self.gate.set()
+        producer.join(2)
+        self.assertTrue(submitted.is_set())
+        self.assertEqual((first.result(1), second.result(1)), (7, 8))
 
-    def test_result_preserves_args_and_kwargs(self):
-        pool = self.make_pool(1)
-        future = pool.apply_async(lambda x, scale: x * scale, (3,), {"scale": 4})
-        self.assertEqual(future.result(timeout=1), 12)
-        self.threads[-1].join(timeout=1)
-        self.assertEqual(pool.scheduler_status, [False])
+    def test_cancel_pending_and_reject_after_close(self):
+        pool = self.pool()
+        first = self.blocked(pool)
+        second = pool.apply_async(lambda: self.fail('cancelled task executed'), (), {})
+        pool.close(wait=False, cancel_pending=True)
+        self.assertTrue(second.cancelled())
+        with self.assertRaisesRegex(RuntimeError, 'closed'):
+            pool.apply_async(lambda: None, (), {})
+        self.gate.set()
+        self.assertEqual(first.result(1), 7)
+        pool.close()
+        self.assertFalse(any(t.is_alive() for t in pool._threads))
 
-    def test_task_exception_completes_future_and_releases_worker(self):
-        pool = self.make_pool(1)
+    def test_teleport_and_task_errors_reach_future_and_worker_recovers(self):
+        pool = self.pool()
+        def fail(_): raise ValueError('teleport failed')
+        pool.scheduler[0].teleport = fail
+        with self.assertRaisesRegex(ValueError, 'teleport failed'):
+            pool.apply_async(lambda: None, (), {}).result(1)
+        pool.scheduler[0].teleport = lambda f:f
+        def task(): raise SystemExit('task failed')
+        self.assertIsInstance(pool.apply_async(task, (), {}).exception(1), SystemExit)
+        self.assertEqual(pool.apply_async(lambda x, scale: x*scale, (3,), {'scale':4}).result(1), 12)
 
-        def task():
-            raise ValueError("worker failed")
+    def test_runner_releases_completed_handles_without_status_call(self):
+        runner = ProcessRunner(1)
+        self.pools.append(runner.pool)
+        handles = [runner.run(lambda: 1) for _ in range(10)]
+        self.assertEqual(list(RPC_Future.as_completed(handles)), [1]*10)
+        runner.pool.close()
+        self.assertEqual(runner.process_handle, [])
+        self.assertEqual(runner.status(), (False, 1, 0, 0))
 
-        future = pool.apply_async(task, (), {})
-        with self.assertRaisesRegex(ValueError, "worker failed"):
-            future.result(timeout=1)
-        self.threads[-1].join(timeout=1)
-        self.assertEqual(pool.scheduler_status, [False])
+    def test_future_timeout_completion_order_and_exception(self):
+        first, second = Future(), Future()
+        handles = [RPC_Future(first, None), RPC_Future(second, None)]
+        with self.assertRaises(TimeoutError): handles[0].get(.01)
+        second.set_result(2)
+        results = RPC_Future.as_completed(handles)
+        self.assertEqual(next(results), 2)
+        first.set_exception(ValueError('failed'))
+        with self.assertRaisesRegex(ValueError, 'failed'): next(results)
 
-    def test_completion_releases_assigned_worker(self):
-        pool = self.make_pool(2)
-        first, release_first, first_thread = self.submit_blocked(pool)
-        second, release_second, second_thread = self.submit_blocked(pool)
-        self.assertEqual(pool.scheduler_status, [True, True])
-        release_first.set()
-        first_thread.join(timeout=1)
-        self.assertEqual(first.result(timeout=1), "done")
-        self.assertFalse(second.done())
-        self.assertEqual(pool.scheduler_status, [False, True])
-        release_second.set()
-        second_thread.join(timeout=1)
-        self.assertEqual(second.result(timeout=1), "done")
-        self.assertEqual(pool.scheduler_status, [False, False])
+    def test_streaming_map_consumes_only_window_and_close_rejects_work(self):
+        seen = []
+        def items():
+            for i in range(100):
+                seen.append(i)
+                yield i
+        with Recursive_RPC([localprocess(1)], max_pending=1) as rpc:
+            result = rpc.imap_ordered(items(), lambda x:x*2)
+            self.assertEqual(next(result), 0)
+            self.assertEqual(len(seen), 2)
+            self.assertEqual(list(result), list(range(2,200,2)))
+        with self.assertRaisesRegex(RuntimeError, 'closed'):
+            rpc.apply_async(lambda: None)
 
-    def test_teleport_failure_releases_worker(self):
-        pool = self.make_pool(1)
+class ProxyShutdownTests(unittest.TestCase):
+    def test_background_close_waits_for_children_before_gateway(self):
+        from recursiverpc.runners import ProxyRunner
+        from unittest.mock import MagicMock
+        proxy = ProxyRunner.__new__(ProxyRunner)
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        child = MagicMock()
+        def close(**kwargs):
+            entered.set()
+            release.wait(2)
+        child.close.side_effect = close
+        gateway = MagicMock()
+        proxy.connection, proxy.weight, proxy.process_handle = [child], [1], []
+        proxy._remote_proxy, proxy._gateway, proxy.conn = None, gateway, None
+        proxy.close(wait=False)
+        self.assertTrue(entered.wait(1))
+        gateway.close.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, 'closed'): proxy.run(lambda:None)
+        def wait_close():
+            proxy.close()
+            finished.set()
+        waiter = threading.Thread(target=wait_close)
+        waiter.start()
+        self.assertFalse(finished.wait(.05))
+        release.set()
+        waiter.join(2)
+        self.assertTrue(finished.is_set())
+        gateway.close.assert_called_once_with(wait=True,cancel_pending=False)
 
-        def teleport(func):
-            raise ValueError("cannot teleport")
-
-        pool.scheduler[0].teleport = teleport
-        with contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(ValueError, "cannot teleport"):
-                pool.apply_async(lambda: None, (), {})
-        self.assertEqual(pool.scheduler_status, [False])
-
-    def test_scheduler_selects_the_only_idle_worker(self):
-        pool = self.make_pool(3)
-        pool.scheduler_index = 0
-        pool.scheduler_status = [True, True, False]
-        with contextlib.redirect_stdout(io.StringIO()):
-            selected = pool._schedule()
-        self.assertIs(selected, pool.scheduler[2], "scheduler skipped the idle worker")
-        self.assertEqual(pool.scheduler_status, [True, True, True])
-
-    def test_future_reports_running_while_task_executes(self):
-        pool = self.make_pool(1)
-        future, _, _ = self.submit_blocked(pool)
-        self.assertTrue(future.running(), "executing task still has a pending Future")
-        self.assertFalse(future.cancel(), "a running task cannot be cancelled")
-
-    def test_worker_stays_busy_until_all_assigned_tasks_finish(self):
-        pool = self.make_pool(1)
-        first, release_first, first_thread = self.submit_blocked(pool)
-        second, release_second, second_thread = self.submit_blocked(pool)
-        release_first.set()
-        first_thread.join(timeout=1)
-        self.assertEqual(first.result(timeout=1), "done")
-        self.assertFalse(second.done())
-        self.assertEqual(pool.scheduler_status, [True])
-        release_second.set()
-        second_thread.join(timeout=1)
-        self.assertEqual(second.result(timeout=1), "done")
-        self.assertEqual(pool.scheduler_status, [False])
-
-    def test_cancelled_pending_task_does_not_execute(self):
-        pool = self.make_pool(1)
-        executed = []
-        with patch.object(rpc, "Thread") as thread:
-            future = pool.apply_async(lambda: executed.append(True), (), {})
-            target = thread.call_args.kwargs["target"]
-        self.assertTrue(future.cancel())
-        target()
-        self.assertTrue(future.cancelled())
-        self.assertEqual(executed, [])
-        self.assertEqual(pool.scheduler_status, [False])
-
-    def test_thread_start_failure_releases_worker(self):
-        pool = self.make_pool(1)
-        with patch.object(rpc, "Thread") as thread:
-            thread.return_value.start.side_effect = RuntimeError("cannot start thread")
-            with self.assertRaisesRegex(RuntimeError, "cannot start thread"):
-                pool.apply_async(lambda: None, (), {})
-        self.assertEqual(pool.scheduler_status, [False])
-
-    def test_base_exception_completes_future_and_releases_worker(self):
-        pool = self.make_pool(1)
-
-        def task():
-            raise SystemExit("worker exited")
-
-        future = pool.apply_async(task, (), {})
-        self.assertIsInstance(future.exception(timeout=1), SystemExit)
-        self.threads[-1].join(timeout=1)
-        self.assertEqual(pool.scheduler_status, [False])
-
-
-if __name__ == "__main__":
-    unittest.main()
+class RemoteNotificationTests(unittest.TestCase):
+    def test_real_rpyc_results_are_bridged_and_released(self):
+        import subprocess
+        import sys
+        server = subprocess.Popen([sys.executable, '-u', '-c',
+            "from rpyc.utils.server import ThreadedServer; "
+            "from rpyc.core.service import ClassicService; "
+            "s=ThreadedServer(ClassicService,hostname='localhost',port=0); "
+            "print(s.port,flush=True); s.start()"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            port = int(server.stdout.readline())
+            runner = NetworkRunner(1, ('localhost', port))
+            try:
+                handle = runner.run(lambda x:x+1, 4)
+                self.assertEqual(handle.get(timeout=10), 5)
+                self.assertIs(type(handle.result), Future)
+                self.assertEqual(list(RPC_Future.as_completed([runner.run(lambda: 6)])), [6])
+                from recursiverpc.runners import ProxyRunner
+                proxy = ProxyRunner.__new__(ProxyRunner)
+                proxy.conn = runner.conn
+                proxy._remote_proxy = runner.conn.modules.recursiverpc.ProxyRunner(
+                    1, None, None, [runner.conn.modules.recursiverpc.localprocess(1)])
+                proxy._gateway = None
+                proxy.connection, proxy.weight, proxy.process_handle = [], [], []
+                proxy._handles_lock = threading.RLock()
+                proxy.process_num = 1
+                try:
+                    remote_handle = proxy.run(lambda: 11)
+                    self.assertIs(type(remote_handle.result), Future)
+                    self.assertEqual(list(RPC_Future.as_completed([remote_handle])), [11])
+                finally:
+                    proxy.close()
+                runner.pool.close()
+                self.assertEqual(runner.status()[2], 0)
+            finally:
+                runner.close()
+        finally:
+            server.terminate()
+            server.communicate(timeout=5)
