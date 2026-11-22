@@ -1,5 +1,8 @@
 # RecursiveRPC
 
+> **Experimental:** This project is in an experimental phase and has not been
+> thoroughly tested.
+
 RecursiveRPC is a Python library for running functions across local processes
 and remote machines over SSH. Built on RPyC, it provides synchronous and
 asynchronous calls, parallel mapping, and nested proxy gateways through a shared
