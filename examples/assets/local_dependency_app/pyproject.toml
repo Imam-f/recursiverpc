@@ -1,0 +1,10 @@
+[project]
+name = "example-local-dependency-app"
+version = "0.1.0"
+dependencies = ["example-helper"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+example-helper = { path = "../helper", editable = true }

@@ -10,6 +10,16 @@ bundled local source code, and custom setup scripts. Compatible SSH workers reus
 copied virtual environments to avoid downloading packages remotely. Deployment
 supports Linux Bash, Windows Git Bash, PowerShell, and cmd.
 
+## Examples
+
+Start with [the small example scripts](examples/README.md): 24 runnable examples
+cover local and asynchronous calls, mapping, errors, nested pools, dependency
+formats, source copying, setup hooks, SSH workers, gateways, and remote commands.
+
+```powershell
+.\.venv\Scripts\python.exe examples/01_local_call.py
+```
+
 ## Worker dependencies
 
 `Recursive_RPC(..., dependency=...)` creates isolated temporary uv projects for
