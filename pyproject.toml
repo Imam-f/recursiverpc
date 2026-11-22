@@ -3,6 +3,8 @@ name = "recursiverpc"
 version = "0.1.0"
 description = "Run Python functions across local processes and recursive SSH worker pools with RPyC."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Imam-f", email = "mohamadimamfirdaus17@gmail.com" }
 ]
