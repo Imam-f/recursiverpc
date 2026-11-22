@@ -1,0 +1,40 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10.16", "3.10"]
+        include:
+          - os: ubuntu-latest
+            required-shells: linux
+          - os: windows-latest
+            required-shells: gitbash,powershell,cmd
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUTF8: "1"
+      RRPC_TEST_REQUIRED_SHELLS: ${{ matrix.required-shells }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv and select Python
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked
+      - name: Run automated tests and native shell checks
+        run: uv run --locked python -B -m unittest discover -v

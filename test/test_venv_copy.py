@@ -12,7 +12,7 @@ import zipfile
 
 from recursiverpc.dependencies import DependencySpec, parse_dependency
 from recursiverpc.venv import compatible, runtime_info, try_copy_environment
-from test_cross_shell import LocalShell
+from test.shells import LocalShell
 
 
 class CompatibilityTests(unittest.TestCase):

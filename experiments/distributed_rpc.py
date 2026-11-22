@@ -10,7 +10,6 @@ import time
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
 import traceback
 
 from typing import Callable, Tuple
@@ -38,6 +37,8 @@ def worker_func(number):
     return number * number
 
 def main():
+    from pathlib import Path
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
     # Create a pool of worker processes
     # The number of processes is set to the number of CPU cores
 

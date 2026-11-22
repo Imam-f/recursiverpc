@@ -238,16 +238,6 @@ tuple. SSH hostnames, key paths, and known_hosts for these children are resolved
 on the gateway. Live local SSH machine objects cannot be copied to a gateway.
 Local proxy groups can also contain nested proxy groups.
 
-Run the isolated regression tests (without SSH credentials):
-
-```powershell
-.\.venv\Scripts\python.exe -B -m unittest discover -s test -p "test_cross_shell.py" -v
-```
-
-On Windows, the Linux Bash tests use the `Ubuntu-22.04` WSL distribution. The
-tests launch a small bootstrap, verify script bytes and shell detection, and
-check startup and cleanup; they do not run the distributed workload.
-
 ### Development and diagnostics
 
 The supported Python range is currently 3.10.16 through 3.10.x
@@ -276,11 +266,27 @@ logging.basicConfig(level=logging.WARNING)
 logging.getLogger("recursiverpc").setLevel(logging.DEBUG)
 ```
 
-Run the automated regression suite from the `test` directory:
+Run the automated suite from the repository root (the same command is used in CI):
 
 ```powershell
-..\.venv\Scripts\python.exe -B -m unittest test_public_api test_pool_scheduling test_proxy_runner test_remote_command test_ssh_setup test_cross_shell test_server_lifecycle test_dependencies test_venv_copy test_local_sources -v
+uv run --locked python -B -m unittest discover -v
 ```
 
-The other scripts in `test` are manual experiments and may require live servers
-or SSH credentials.
+The `test/` package contains only automated tests and shared fixtures. Discovery
+does not load `.env` files or contact SSH/RPC infrastructure. Integration tests
+start their own local workers and loopback servers, clean up temporary projects,
+and may download packages/build tools with uv; an offline package cache is not
+required. These tests do not require SSH credentials or a pre-existing server.
+
+Shell tests exercise real command quoting, Unicode script upload, working
+directories, environment variables, startup, and cleanup. Locally, unavailable
+shells are skipped. On Windows, the optional Linux Bash check needs the
+`Ubuntu-22.04` WSL distribution, not just the `wsl` executable.
+
+[CI](.github/workflows/tests.yml) runs the full suite on Linux and Windows with
+Python 3.10.16 and the latest 3.10 patch. Linux requires Bash; Windows requires
+Git Bash, PowerShell, and cmd. `RRPC_TEST_REQUIRED_SHELLS` makes missing CI shells
+fail instead of silently skipping them. CI never needs a remote SSH host.
+
+Historical infrastructure experiments live in [experiments/](experiments/README.md).
+Use [examples/](examples/README.md) for small, current library demonstrations.

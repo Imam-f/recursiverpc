@@ -17,7 +17,7 @@ from recursiverpc import Recursive_RPC, SetupScript, localprocess
 from recursiverpc.dependencies import DependencySpec, parse_dependency
 from recursiverpc.setup import parse_setup, setup_code
 from recursiverpc.sources import extract_sources
-from test_cross_shell import LocalShell
+from test.shells import LocalShell
 
 
 def local_probe():
